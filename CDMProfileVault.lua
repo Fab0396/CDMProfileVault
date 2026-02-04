@@ -5,9 +5,128 @@ local ADDON_NAME = ...
 local SV_NAME = "CDMProfileVaultDB"
 
 -- =========================
+-- Addon comms (share/import)
+-- =========================
+local COMM_PREFIX = "CDMPV1"
+local CHUNK_SIZE = 220
+local SEND_INTERVAL = 0.02
+
+local PendingIncoming = {}   -- [id] = {from, className, profileName, total, parts={}, got={}, gotCount=0, recvChannel}
+local CompletedShares = {}   -- [id] = {from, className, profileName, text, receivedAt}
+local PendingAccept = nil    -- {id, from, className, profileName, text}
+
+local sendQueue = {}
+local sendTicker = nil
+
+local function EnsurePrefixRegistered()
+  if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+    pcall(C_ChatInfo.RegisterAddonMessagePrefix, COMM_PREFIX)
+  else
+    pcall(RegisterAddonMessagePrefix, COMM_PREFIX)
+  end
+end
+
+local function SafeSendAddonMessage(msg, channel, target)
+  EnsurePrefixRegistered()
+  if C_ChatInfo and C_ChatInfo.SendAddonMessage then
+    if channel == "WHISPER" then
+      C_ChatInfo.SendAddonMessage(COMM_PREFIX, msg, channel, target)
+    else
+      C_ChatInfo.SendAddonMessage(COMM_PREFIX, msg, channel)
+    end
+  else
+    SendAddonMessage(COMM_PREFIX, msg, channel, target)
+  end
+end
+
+local function EnqueueSend(channel, target, msg)
+  sendQueue[#sendQueue + 1] = { ch = channel, to = target, msg = msg }
+  if sendTicker then return end
+
+  if not C_Timer or not C_Timer.NewTicker then
+    local item = table.remove(sendQueue, 1)
+    if item then SafeSendAddonMessage(item.msg, item.ch, item.to) end
+    return
+  end
+
+  sendTicker = C_Timer.NewTicker(SEND_INTERVAL, function()
+    if #sendQueue == 0 then
+      sendTicker:Cancel()
+      sendTicker = nil
+      return
+    end
+    local item = table.remove(sendQueue, 1)
+    if item then
+      SafeSendAddonMessage(item.msg, item.ch, item.to)
+    end
+  end)
+end
+
+local function MakeShareId()
+  local t = time()
+  local r = math.random(1000, 9999)
+  return tostring(t) .. "-" .. tostring(r)
+end
+
+local function Trim(s)
+  if not s then return "" end
+  return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function SanitizeField(s)
+  s = s or ""
+  s = s:gsub("|", "/")
+  s = s:gsub("\n", " ")
+  return s
+end
+
+local function ChatPrint(msg)
+  if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
+    DEFAULT_CHAT_FRAME:AddMessage(msg)
+  else
+    print(msg)
+  end
+end
+
+local function ShareLink(id)
+  return "|Hcdmpv:" .. id .. "|h|cff00ff00[Click to import]|r|h"
+end
+
+local function StartShare(className, profileName, text, channel, target)
+  if not text or text == "" then
+    print("CDMProfileVault: Nothing to share (empty string).")
+    return
+  end
+
+  EnsurePrefixRegistered()
+
+  local id = MakeShareId()
+  className = SanitizeField(className)
+  profileName = SanitizeField(profileName)
+
+  local parts = {}
+  for i = 1, #text, CHUNK_SIZE do
+    parts[#parts + 1] = text:sub(i, i + CHUNK_SIZE - 1)
+  end
+
+  -- META: M|id|class|name|totalParts
+  EnqueueSend(channel, target, table.concat({ "M", id, className, profileName, tostring(#parts) }, "|"))
+
+  -- DATA: D|id|idx|payload
+  for idx, chunk in ipairs(parts) do
+    EnqueueSend(channel, target, "D|" .. id .. "|" .. idx .. "|" .. chunk)
+  end
+
+  if channel == "WHISPER" then
+    print("CDMProfileVault: Sent share to " .. (target or "?") .. ".")
+  else
+    print("CDMProfileVault: Sent share to " .. channel .. ".")
+  end
+end
+
+-- =========================
 -- Data
 -- =========================
-
 local CLASSES = {
   "Death Knight",
   "Demon Hunter",
@@ -67,7 +186,6 @@ local function ClassIconMarkup(className, size)
   )
 end
 
--- Fixed date format: DD Mon YYYY
 local FIXED_DATE_FORMAT = "%d %b %Y"
 
 local DEFAULTS = {
@@ -100,7 +218,6 @@ end
 -- =========================
 -- Style helpers
 -- =========================
-
 local function AddToUISpecialFrames(frameName)
   if not UISpecialFrames then return end
   for i = 1, #UISpecialFrames do
@@ -170,16 +287,15 @@ end
 -- =========================
 -- Profile safety system
 -- =========================
-
 local function NormalizeProfile(p)
   if not p then return end
   if p.name == nil then p.name = "" end
   if p.text == nil then p.text = "" end
   if p.lastPasted == nil then p.lastPasted = 0 end
-
-  -- lastSaved is ONLY updated when pressing Save.
   if p.lastSavedName == nil then p.lastSavedName = p.name end
   if p.lastSavedText == nil then p.lastSavedText = p.text end
+  if p.sharedFrom == nil then p.sharedFrom = nil end
+  if p.sharedAt == nil then p.sharedAt = nil end
 end
 
 local function SafetyRestoreProfileIfEmptied(p)
@@ -216,7 +332,6 @@ local function EnsureProfilesForClass(className)
   return profiles
 end
 
--- Restore empties across ALL profiles before SavedVariables write (/reload/logout/exit)
 local function RestoreAllProfilesIfEmptied()
   if not DB or not DB.classes then return end
   for _, className in ipairs(CLASSES) do
@@ -232,7 +347,6 @@ end
 -- =========================
 -- Minimap button
 -- =========================
-
 local MinimapButton
 
 local function UpdateMinimapButtonPosition()
@@ -299,7 +413,6 @@ end
 -- =========================
 -- Dropdown helper (class only)
 -- =========================
-
 local function CreateDropdownButton(parent, width, height)
   local ok, dd = pcall(CreateFrame, "DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
   if ok and dd then
@@ -319,7 +432,6 @@ end
 -- =========================
 -- UI state
 -- =========================
-
 local UI = {
   frame = nil,
 
@@ -340,6 +452,7 @@ local UI = {
   textEdit = nil,
 
   lastPastedLabel = nil,
+  sharedByLabel = nil,
 
   deleteBtn = nil,
   copyBtn = nil,
@@ -411,12 +524,26 @@ local function SetButtonsEnabled(enabled)
   end
 end
 
+local function UpdateSharedByLabel(p)
+  if not UI.sharedByLabel then return end
+  if p and p.sharedFrom then
+    local who = Ambiguate(p.sharedFrom, "short")
+    local when = p.sharedAt and FormatTimestamp(p.sharedAt) or "?"
+    UI.sharedByLabel:SetText("Shared by: " .. who .. " (" .. when .. ")")
+    UI.sharedByLabel:Show()
+  else
+    UI.sharedByLabel:SetText("")
+    UI.sharedByLabel:Hide()
+  end
+end
+
 local function UpdateEditor()
   local p = GetSelectedProfile()
   if not p then
     UI.nameEdit:SetText("")
     UI.textEdit:SetText("")
     UI.lastPastedLabel:SetText("Last pasted: Never")
+    UpdateSharedByLabel(nil)
     SetButtonsEnabled(false)
     return
   end
@@ -427,6 +554,7 @@ local function UpdateEditor()
   UI.nameEdit:SetText(p.name or "")
   UI.textEdit:SetText(p.text or "")
   UI.lastPastedLabel:SetText("Last pasted: " .. FormatTimestamp(p.lastPasted))
+  UpdateSharedByLabel(p)
 end
 
 local function AutoSaveName()
@@ -479,7 +607,12 @@ local function RefreshList()
       NormalizeProfile(p)
       btn:Show()
       btn.index = i
+
       local displayName = (p.name and p.name ~= "" and p.name) or ("Profile " .. i)
+      if p.sharedFrom then
+        displayName = displayName .. " (" .. Ambiguate(p.sharedFrom, "short") .. ")"
+      end
+
       btn.text:SetText(displayName)
       if UI.selectedProfileIndex == i then btn.hl:Show() else btn.hl:Hide() end
     else
@@ -523,7 +656,8 @@ StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = StaticPopupDialogs["CDM_
   whileDead = true,
   hideOnEscape = true,
   preferredIndex = 3,
-  OnAccept = function(_, data)
+  OnAccept = function(self, data)
+    data = data or self.data
     if not data or not data.className or not data.index then return end
     local className = data.className
     local idx = data.index
@@ -540,10 +674,144 @@ StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = StaticPopupDialogs["CDM_
   end,
 }
 
+-- ===== Share "send to" popup (FIXED for new StaticPopup templates) =====
+StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] or {
+  text = "Share this profile.\n\nEnter player name (Name-Realm) to whisper.\nLeave blank to send to Party/Raid.",
+  button1 = "Send",
+  button2 = "Cancel",
+  hasEditBox = true,
+  editBoxWidth = 220,
+  timeout = 0,
+  whileDead = true,
+  hideOnEscape = true,
+  preferredIndex = 3,
+
+  OnShow = function(self, data)
+    self.data = data
+    local eb = self.editBox or self.EditBox
+    if eb then
+      eb:SetText((data and data.defaultTarget) or "")
+      eb:HighlightText()
+      eb:SetFocus()
+    end
+  end,
+
+  OnAccept = function(self, data)
+    data = data or self.data
+    if not data or not data.payload then return end
+
+    local eb = self.editBox or self.EditBox
+    local target = Trim(eb and eb:GetText() or "")
+
+    local channel, whisperTarget = nil, nil
+
+    if target ~= "" then
+      channel = "WHISPER"
+      whisperTarget = target
+    else
+      local inInstRaid = IsInRaid and IsInRaid(LE_PARTY_CATEGORY_INSTANCE)
+      local inInstParty = IsInGroup and IsInGroup(LE_PARTY_CATEGORY_INSTANCE)
+
+      if inInstRaid or inInstParty then
+        channel = "INSTANCE_CHAT"
+      elseif IsInRaid() then
+        channel = "RAID"
+      elseif IsInGroup() then
+        channel = "PARTY"
+      else
+        print("CDMProfileVault: Not in a group. Enter a player name to share.")
+        return
+      end
+    end
+
+    StartShare(data.payload.className, data.payload.profileName, data.payload.text, channel, whisperTarget)
+  end,
+
+  EditBoxOnEnterPressed = function(editBox)
+    local dialog = editBox.owningDialog or editBox:GetParent()
+    if type(StaticPopup_OnClick) == "function" then
+      StaticPopup_OnClick(dialog, 1)
+      return
+    end
+
+    local b =
+      (dialog.button1) or
+      (dialog.Button1) or
+      (dialog.ButtonContainer and dialog.ButtonContainer.Button1) or
+      (dialog.Buttons and dialog.Buttons[1])
+
+    if b and b.Click then b:Click() end
+  end,
+}
+
+-- ===== Incoming accept popup (triggered by clicking the chat link) =====
+StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] or {
+  text = "Accept shared profile?",
+  button1 = "Accept",
+  button2 = "Decline",
+  timeout = 0,
+  whileDead = true,
+  hideOnEscape = true,
+  preferredIndex = 3,
+  OnShow = function(self)
+    if not PendingAccept then return end
+    local who = Ambiguate(PendingAccept.from or "?", "short")
+    self.text:SetText("Accept profile from:\n\n" .. who ..
+      "\n\nClass: " .. (PendingAccept.className or "?") ..
+      "\nName: " .. (PendingAccept.profileName or "?"))
+  end,
+  OnAccept = function()
+    if not PendingAccept then return end
+
+    local id = PendingAccept.id
+    local className = PendingAccept.className
+    local profName = PendingAccept.profileName
+    local text = PendingAccept.text
+    local from = PendingAccept.from
+
+    if not className or not DB.classes or not DB.classes[className] then
+      print("CDMProfileVault: Could not import (unknown class).")
+      PendingAccept = nil
+      return
+    end
+
+    local profiles = EnsureProfilesForClass(className)
+
+    local p = {
+      name = profName or "Shared Profile",
+      text = text or "",
+      lastPasted = time(),
+
+      lastSavedName = profName or "Shared Profile",
+      lastSavedText = text or "",
+
+      sharedFrom = from,
+      sharedAt = time(),
+    }
+    NormalizeProfile(p)
+    table.insert(profiles, p)
+
+    print("CDMProfileVault: Imported shared profile from " .. Ambiguate(from or "?", "short") .. ".")
+
+    if id then CompletedShares[id] = nil end
+
+    if UI.frame and UI.frame:IsShown() then
+      SelectClass(className)
+      UI.selectedProfileIndex = #EnsureProfilesForClass(className)
+      UpdateEditor()
+      RefreshList()
+    end
+
+    PendingAccept = nil
+  end,
+  OnCancel = function()
+    PendingAccept = nil
+  end,
+}
+
 -- =========================
 -- Class dropdown
 -- =========================
-
 local function SetupClassDropdown(parent, labelFrame)
   local dd = CreateDropdownButton(parent, 240, 30)
   if dd then
@@ -588,7 +856,6 @@ end
 -- =========================
 -- Copy popup
 -- =========================
-
 local function ShowCopyFrame(text)
   if not UI.copyFrame then
     local f = CreateFrame("Frame", "CDMProfileVaultCopyFrame", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
@@ -633,40 +900,8 @@ local function ShowCopyFrame(text)
 end
 
 -- =========================
--- Share helper (prefill chat input so it can be copied/sent)
--- =========================
-
-local CHAT_PREFILL_MAX = 240
-
-local function ChatPrint(msg)
-  if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
-    DEFAULT_CHAT_FRAME:AddMessage(msg)
-  else
-    print(msg)
-  end
-end
-
-local function OpenChatAndHighlight(text)
-  local chatFrame = DEFAULT_CHAT_FRAME or ChatFrame1
-  if not chatFrame or not chatFrame.editBox then return false end
-
-  if type(ChatFrame_OpenChat) == "function" then
-    ChatFrame_OpenChat("", chatFrame)
-  else
-    chatFrame.editBox:Show()
-  end
-
-  local eb = chatFrame.editBox
-  eb:SetText(text or "")
-  eb:HighlightText()
-  eb:SetFocus()
-  return true
-end
-
--- =========================
 -- UI
 -- =========================
-
 local function CreateUI()
   local f = CreateFrame("Frame", "CDMProfileVaultFrame", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
   f:SetSize(780, 540)
@@ -790,7 +1025,6 @@ local function CreateUI()
     if w and w > 1 then UI.listChild:SetWidth(w) end
   end)
 
-  -- Right content
   local right = CreateFrame("Frame", nil, rightPanel)
   right:SetPoint("TOPLEFT", 12, -12)
   right:SetPoint("BOTTOMRIGHT", -12, 12)
@@ -903,12 +1137,16 @@ local function CreateUI()
     if UI.textEdit and UI.textEdit:IsEnabled() then UI.textEdit:SetFocus() end
   end)
 
+  UI.sharedByLabel = right:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  UI.sharedByLabel:SetPoint("BOTTOMLEFT", 0, BUTTON_ROW_H + 24)
+  UI.sharedByLabel:SetText("")
+  UI.sharedByLabel:Hide()
+
   local last = right:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
   last:SetPoint("BOTTOMLEFT", 0, BUTTON_ROW_H + 6)
   last:SetText("Last pasted: Never")
   UI.lastPastedLabel = last
 
-  -- Buttons row (Save / Paste / Copy / Share / Delete)
   local BTN_W = 80
 
   local saveBtn = CreateFrame("Button", nil, right, "UIPanelButtonTemplate")
@@ -924,7 +1162,6 @@ local function CreateUI()
     p.name = UI.nameEdit:GetText() or ""
     p.text = UI.textEdit:GetText() or ""
 
-    -- Confirm save (even if empty)
     p.lastSavedName = p.name
     p.lastSavedText = p.text
 
@@ -970,26 +1207,21 @@ local function CreateUI()
     local profileName = (p.name and p.name ~= "" and p.name) or ("Profile " .. UI.selectedProfileIndex)
     local payload = p.text or ""
     if payload == "" then
-      ChatPrint("[CDMProfileVault] Nothing to share (empty string).")
+      print("CDMProfileVault: Nothing to share (empty string).")
       return
     end
 
-    local full = string.format("[CDMProfileVault] %s / %s: %s", UI.selectedClass, profileName, payload)
-
-    -- Always open Copy window with the full message
-    ShowCopyFrame(full)
-
-    local prefill = full
-    if #prefill > CHAT_PREFILL_MAX then
-      prefill = prefill:sub(1, CHAT_PREFILL_MAX)
-      ChatPrint(string.format("[CDMProfileVault] Chat is length-limited; prefilling first %d chars. Full text is in the Copy window.", CHAT_PREFILL_MAX))
-    else
-      ChatPrint("[CDMProfileVault] Prefilled chat input. Press Enter to send or Esc to cancel.")
+    local defaultTarget = ""
+    if UnitExists("target") and UnitIsPlayer("target") then
+      local n, r = UnitName("target")
+      if n and r and r ~= "" then defaultTarget = n .. "-" .. r
+      elseif n then defaultTarget = n end
     end
 
-    if not OpenChatAndHighlight(prefill) then
-      ChatPrint("[CDMProfileVault] Could not open chat input; use the Copy window instead.")
-    end
+    StaticPopup_Show("CDM_PROFILEVAULT_SHARE_TO", nil, nil, {
+      defaultTarget = defaultTarget,
+      payload = { className = UI.selectedClass, profileName = profileName, text = payload },
+    })
   end)
 
   local deleteBtn = CreateFrame("Button", nil, right, "UIPanelButtonTemplate")
@@ -1009,9 +1241,8 @@ local function CreateUI()
 end
 
 -- =========================
--- Open / toggle
+-- Toggle / slash
 -- =========================
-
 local function ToggleMainFrame()
   if not UI.frame then return end
   if UI.frame:IsShown() then
@@ -1035,15 +1266,127 @@ SlashCmdList["CDMPROFILEVAULT"] = function()
 end
 
 -- =========================
+-- Clickable chat link handler
+-- =========================
+local function HandleShareLinkClick(id)
+  if not id or id == "" then return end
+  local data = CompletedShares[id]
+  if not data then
+    print("CDMProfileVault: That share is no longer available.")
+    return
+  end
+
+  if not (UI.frame and UI.frame:IsShown()) then
+    ToggleMainFrame()
+  end
+
+  PendingAccept = {
+    id = id,
+    from = data.from,
+    className = data.className,
+    profileName = data.profileName,
+    text = data.text,
+  }
+  StaticPopup_Show("CDM_PROFILEVAULT_ACCEPT_SHARE")
+end
+
+if not _G.CDMPV_SetItemRefWrapped then
+  _G.CDMPV_SetItemRefWrapped = true
+  local orig = SetItemRef
+  SetItemRef = function(link, text, button, chatFrame)
+    local linkType, id = strsplit(":", link, 2)
+    if linkType == "cdmpv" then
+      HandleShareLinkClick(id)
+      return
+    end
+    return orig(link, text, button, chatFrame)
+  end
+end
+
+-- =========================
+-- Incoming comms handler
+-- =========================
+local function OnAddonMessage(prefix, msg, channel, sender)
+  if prefix ~= COMM_PREFIX then return end
+  if not msg or msg == "" then return end
+  if not sender or sender == "" then return end
+
+  local myName = UnitName("player")
+  if myName and Ambiguate(sender, "short") == myName then return end
+
+  local typ = msg:sub(1, 1)
+
+  if typ == "M" then
+    local _, id, className, profileName, total = strsplit("|", msg, 5)
+    total = tonumber(total or "0") or 0
+    if not id or id == "" or total <= 0 then return end
+
+    PendingIncoming[id] = {
+      from = sender,
+      className = className or "Unknown",
+      profileName = profileName or "Shared Profile",
+      total = total,
+      parts = {},
+      got = {},
+      gotCount = 0,
+      recvChannel = channel,
+    }
+    return
+  end
+
+  if typ == "D" then
+    local _, id, idx, payload = strsplit("|", msg, 4)
+    if not id or not PendingIncoming[id] then return end
+    local p = PendingIncoming[id]
+    idx = tonumber(idx or "0") or 0
+    if idx <= 0 or idx > p.total then return end
+
+    if not p.got[idx] then
+      p.got[idx] = true
+      p.parts[idx] = payload or ""
+      p.gotCount = p.gotCount + 1
+    end
+
+    if p.gotCount >= p.total then
+      local full = table.concat(p.parts, "")
+      PendingIncoming[id] = nil
+
+      local ch = p.recvChannel
+      if ch == "PARTY" or ch == "RAID" or ch == "WHISPER" or ch == "INSTANCE_CHAT" then
+        CompletedShares[id] = {
+          from = p.from,
+          className = p.className,
+          profileName = p.profileName,
+          text = full,
+          receivedAt = time(),
+        }
+
+        local who = Ambiguate(p.from, "short")
+        ChatPrint(string.format(
+          "|cff00ff00[CDMProfileVault]|r %s shared: %s / %s %s",
+          who,
+          p.className or "?",
+          p.profileName or "?",
+          ShareLink(id)
+        ))
+      end
+    end
+    return
+  end
+end
+
+-- =========================
 -- Boot + Logout safety
 -- =========================
-
 local loader = CreateFrame("Frame")
 loader:RegisterEvent("ADDON_LOADED")
 loader:RegisterEvent("PLAYER_LOGOUT")
-loader:SetScript("OnEvent", function(_, event, name)
+loader:RegisterEvent("CHAT_MSG_ADDON")
+loader:SetScript("OnEvent", function(_, event, a1, a2, a3, a4)
   if event == "ADDON_LOADED" then
-    if name ~= ADDON_NAME then return end
+    if a1 ~= ADDON_NAME then return end
+
+    EnsurePrefixRegistered()
 
     InitDB()
     UI.selectedClass = UI.selectedClass or CLASSES[1]
@@ -1068,6 +1411,12 @@ loader:SetScript("OnEvent", function(_, event, name)
   if event == "PLAYER_LOGOUT" then
     RestoreAllProfilesIfEmptied()
     SafetyRestoreCurrentProfileIfEmptied()
+    return
+  end
+
+  if event == "CHAT_MSG_ADDON" then
+    local prefix, msg, channel, sender = a1, a2, a3, a4
+    OnAddonMessage(prefix, msg, channel, sender)
     return
   end
 end)
