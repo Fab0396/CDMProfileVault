@@ -8,6 +8,7 @@ local SV_NAME = "CDMProfileVaultDB"
 -- Addon comms (share/import)
 -- =========================
 local COMM_PREFIX = "CDMPV1"
+local SEP = "\31" -- Unit Separator (safe; profile strings may contain '|')
 local CHUNK_SIZE = 220
 local SEND_INTERVAL = 0.02
 
@@ -75,7 +76,6 @@ end
 
 local function SanitizeField(s)
   s = s or ""
-  s = s:gsub("|", "/")
   s = s:gsub("\n", " ")
   return s
 end
@@ -92,6 +92,12 @@ local function ShareLink(id)
   return "|Hcdmpv:" .. id .. "|h|cff00ff00[Click to import]|r|h"
 end
 
+local function GetMyFullName()
+  local n, r = UnitFullName("player")
+  if r and r ~= "" then return n .. "-" .. r end
+  return n
+end
+
 local function StartShare(className, profileName, text, channel, target)
   if not text or text == "" then
     print("CDMProfileVault: Nothing to share (empty string).")
@@ -104,17 +110,18 @@ local function StartShare(className, profileName, text, channel, target)
   className = SanitizeField(className)
   profileName = SanitizeField(profileName)
 
+  -- Split into chunks
   local parts = {}
   for i = 1, #text, CHUNK_SIZE do
     parts[#parts + 1] = text:sub(i, i + CHUNK_SIZE - 1)
   end
 
-  -- META: M|id|class|name|totalParts
-  EnqueueSend(channel, target, table.concat({ "M", id, className, profileName, tostring(#parts) }, "|"))
+  -- META: M<SEP>id<SEP>class<SEP>name<SEP>totalParts
+  EnqueueSend(channel, target, table.concat({ "M", id, className, profileName, tostring(#parts) }, SEP))
 
-  -- DATA: D|id|idx|payload
+  -- DATA: D<SEP>id<SEP>idx<SEP>payload
   for idx, chunk in ipairs(parts) do
-    EnqueueSend(channel, target, "D|" .. id .. "|" .. idx .. "|" .. chunk)
+    EnqueueSend(channel, target, table.concat({ "D", id, tostring(idx), chunk }, SEP))
   end
 
   if channel == "WHISPER" then
@@ -301,13 +308,8 @@ end
 local function SafetyRestoreProfileIfEmptied(p)
   if not p then return end
   NormalizeProfile(p)
-
-  if p.name == "" and (p.lastSavedName or "") ~= "" then
-    p.name = p.lastSavedName
-  end
-  if p.text == "" and (p.lastSavedText or "") ~= "" then
-    p.text = p.lastSavedText
-  end
+  if p.name == "" and (p.lastSavedName or "") ~= "" then p.name = p.lastSavedName end
+  if p.text == "" and (p.lastSavedText or "") ~= "" then p.text = p.lastSavedText end
 end
 
 local function InitDB()
@@ -647,8 +649,11 @@ local function JumpToPlayerClass()
   end
 end
 
--- ===== Delete confirmation popup =====
-StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] or {
+-- =========================
+-- StaticPopups (overwrite every load)
+-- =========================
+
+StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = {
   text = "Delete profile '%s'?",
   button1 = "Delete",
   button2 = "Cancel",
@@ -674,8 +679,7 @@ StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = StaticPopupDialogs["CDM_
   end,
 }
 
--- ===== Share "send to" popup (FIXED for new StaticPopup templates) =====
-StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] or {
+StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = {
   text = "Share this profile.\n\nEnter player name (Name-Realm) to whisper.\nLeave blank to send to Party/Raid.",
   button1 = "Send",
   button2 = "Cancel",
@@ -708,6 +712,9 @@ StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = StaticPopupDialogs["CDM_PROFIL
     if target ~= "" then
       channel = "WHISPER"
       whisperTarget = target
+      if not target:find("-", 1, true) then
+        print("CDMProfileVault: Note: If the player is on another realm, use Name-Realm.")
+      end
     else
       local inInstRaid = IsInRaid and IsInRaid(LE_PARTY_CATEGORY_INSTANCE)
       local inInstParty = IsInGroup and IsInGroup(LE_PARTY_CATEGORY_INSTANCE)
@@ -733,19 +740,10 @@ StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = StaticPopupDialogs["CDM_PROFIL
       StaticPopup_OnClick(dialog, 1)
       return
     end
-
-    local b =
-      (dialog.button1) or
-      (dialog.Button1) or
-      (dialog.ButtonContainer and dialog.ButtonContainer.Button1) or
-      (dialog.Buttons and dialog.Buttons[1])
-
-    if b and b.Click then b:Click() end
   end,
 }
 
--- ===== Incoming accept popup (triggered by clicking the chat link) =====
-StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] or {
+StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = {
   text = "Accept shared profile?",
   button1 = "Accept",
   button2 = "Decline",
@@ -753,13 +751,22 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = StaticPopupDialogs["CDM_PR
   whileDead = true,
   hideOnEscape = true,
   preferredIndex = 3,
+
+  -- FIX: some builds have self.Text not self.text
   OnShow = function(self)
     if not PendingAccept then return end
     local who = Ambiguate(PendingAccept.from or "?", "short")
-    self.text:SetText("Accept profile from:\n\n" .. who ..
+
+    local textRegion = self.text or self.Text
+    if not textRegion then return end
+
+    textRegion:SetText(
+      "Accept profile from:\n\n" .. who ..
       "\n\nClass: " .. (PendingAccept.className or "?") ..
-      "\nName: " .. (PendingAccept.profileName or "?"))
+      "\nName: " .. (PendingAccept.profileName or "?")
+    )
   end,
+
   OnAccept = function()
     if not PendingAccept then return end
 
@@ -776,15 +783,12 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = StaticPopupDialogs["CDM_PR
     end
 
     local profiles = EnsureProfilesForClass(className)
-
     local p = {
       name = profName or "Shared Profile",
       text = text or "",
       lastPasted = time(),
-
       lastSavedName = profName or "Shared Profile",
       lastSavedText = text or "",
-
       sharedFrom = from,
       sharedAt = time(),
     }
@@ -793,7 +797,8 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = StaticPopupDialogs["CDM_PR
 
     print("CDMProfileVault: Imported shared profile from " .. Ambiguate(from or "?", "short") .. ".")
 
-    if id then CompletedShares[id] = nil end
+    -- IMPORTANT: do NOT clear CompletedShares[id] anymore (so links don't "expire")
+    -- if id then CompletedShares[id] = nil end
 
     if UI.frame and UI.frame:IsShown() then
       SelectClass(className)
@@ -804,6 +809,7 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = StaticPopupDialogs["CDM_PR
 
     PendingAccept = nil
   end,
+
   OnCancel = function()
     PendingAccept = nil
   end,
@@ -1255,10 +1261,6 @@ local function ToggleMainFrame()
   end
 end
 
-function CDMProfileVault_Toggle()
-  ToggleMainFrame()
-end
-
 SLASH_CDMPROFILEVAULT1 = "/cdmv"
 SLASH_CDMPROFILEVAULT2 = "/cdmprofilevault"
 SlashCmdList["CDMPROFILEVAULT"] = function()
@@ -1311,13 +1313,13 @@ local function OnAddonMessage(prefix, msg, channel, sender)
   if not msg or msg == "" then return end
   if not sender or sender == "" then return end
 
-  local myName = UnitName("player")
-  if myName and Ambiguate(sender, "short") == myName then return end
+  local myFull = GetMyFullName()
+  if sender == myFull then return end
 
   local typ = msg:sub(1, 1)
 
   if typ == "M" then
-    local _, id, className, profileName, total = strsplit("|", msg, 5)
+    local _, id, className, profileName, total = strsplit(SEP, msg, 5)
     total = tonumber(total or "0") or 0
     if not id or id == "" or total <= 0 then return end
 
@@ -1335,7 +1337,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
   end
 
   if typ == "D" then
-    local _, id, idx, payload = strsplit("|", msg, 4)
+    local _, id, idx, payload = strsplit(SEP, msg, 4)
     if not id or not PendingIncoming[id] then return end
     local p = PendingIncoming[id]
     idx = tonumber(idx or "0") or 0
@@ -1380,6 +1382,7 @@ end
 -- =========================
 local loader = CreateFrame("Frame")
 loader:RegisterEvent("ADDON_LOADED")
+loader:RegisterEvent("PLAYER_LOGIN")
 loader:RegisterEvent("PLAYER_LOGOUT")
 loader:RegisterEvent("CHAT_MSG_ADDON")
 loader:SetScript("OnEvent", function(_, event, a1, a2, a3, a4)
@@ -1387,8 +1390,8 @@ loader:SetScript("OnEvent", function(_, event, a1, a2, a3, a4)
     if a1 ~= ADDON_NAME then return end
 
     EnsurePrefixRegistered()
-
     InitDB()
+
     UI.selectedClass = UI.selectedClass or CLASSES[1]
     EnsureProfilesForClass(UI.selectedClass)
 
@@ -1405,6 +1408,11 @@ loader:SetScript("OnEvent", function(_, event, a1, a2, a3, a4)
     end
 
     print("CDMProfileVault loaded. Use /cdmv to open.")
+    return
+  end
+
+  if event == "PLAYER_LOGIN" then
+    EnsurePrefixRegistered()
     return
   end
 
