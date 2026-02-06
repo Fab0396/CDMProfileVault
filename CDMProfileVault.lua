@@ -8,13 +8,13 @@ local SV_NAME = "CDMProfileVaultDB"
 -- Addon comms (share/import)
 -- =========================
 local COMM_PREFIX = "CDMPV1"
-local SEP = "\31" -- Unit Separator (safe; profile strings may contain '|')
+local SEP = "\31" -- Unit Separator (safe)
 local CHUNK_SIZE = 220
 local SEND_INTERVAL = 0.02
 
-local PendingIncoming = {}   -- [id] = {from, className, profileName, total, parts={}, got={}, gotCount=0, recvChannel}
-local CompletedShares = {}   -- [id] = {from, className, profileName, text, receivedAt}
-local PendingAccept = nil    -- {id, from, className, profileName, text}
+local PendingIncoming = {}   -- [id] = {from, kind, className, profileName, total, parts={}, got={}, gotCount=0, recvChannel}
+local CompletedShares = {}   -- [id] = {from, kind, className, profileName, text, receivedAt}
+local PendingAccept = nil    -- {id, from, kind, className, profileName, text}
 
 local sendQueue = {}
 local sendTicker = nil
@@ -98,7 +98,16 @@ local function GetMyFullName()
   return n
 end
 
-local function StartShare(className, profileName, text, channel, target)
+local function KindLabel(kind)
+  if kind == "BUNDLE_CLASS" then return "Bundle (Class)" end
+  if kind == "BUNDLE_ALL" then return "Bundle (All)" end
+  return "Profile"
+end
+
+-- kind: "PROFILE" | "BUNDLE_CLASS" | "BUNDLE_ALL"
+local function StartShare(kind, className, profileName, text, channel, target)
+  kind = kind or "PROFILE"
+
   if not text or text == "" then
     print("CDMProfileVault: Nothing to share (empty string).")
     return
@@ -110,14 +119,13 @@ local function StartShare(className, profileName, text, channel, target)
   className = SanitizeField(className)
   profileName = SanitizeField(profileName)
 
-  -- Split into chunks
   local parts = {}
   for i = 1, #text, CHUNK_SIZE do
     parts[#parts + 1] = text:sub(i, i + CHUNK_SIZE - 1)
   end
 
-  -- META: M<SEP>id<SEP>class<SEP>name<SEP>totalParts
-  EnqueueSend(channel, target, table.concat({ "M", id, className, profileName, tostring(#parts) }, SEP))
+  -- META (v2): M<SEP>id<SEP>kind<SEP>class<SEP>name<SEP>totalParts
+  EnqueueSend(channel, target, table.concat({ "M", id, kind, className, profileName, tostring(#parts) }, SEP))
 
   -- DATA: D<SEP>id<SEP>idx<SEP>payload
   for idx, chunk in ipairs(parts) do
@@ -125,9 +133,9 @@ local function StartShare(className, profileName, text, channel, target)
   end
 
   if channel == "WHISPER" then
-    print("CDMProfileVault: Sent share to " .. (target or "?") .. ".")
+    print("CDMProfileVault: Sent " .. KindLabel(kind) .. " to " .. (target or "?") .. ".")
   else
-    print("CDMProfileVault: Sent share to " .. channel .. ".")
+    print("CDMProfileVault: Sent " .. KindLabel(kind) .. " to " .. channel .. ".")
   end
 end
 
@@ -223,6 +231,293 @@ local function FormatTimestamp(ts)
 end
 
 -- =========================
+-- Base64 (bundle import/export)
+-- =========================
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function b64enc(data)
+  data = data or ""
+  if data == "" then return "" end
+
+  local s = data:gsub(".", function(x)
+    local byte = x:byte()
+    local bits = ""
+    for i = 8, 1, -1 do
+      local p = 2 ^ (i - 1)
+      bits = bits .. ((byte >= p) and "1" or "0")
+      if byte >= p then byte = byte - p end
+    end
+    return bits
+  end)
+
+  s = s .. "0000"
+  s = s:gsub("%d%d%d?%d?%d?%d?", function(x)
+    if #x < 6 then return "" end
+    local c = 0
+    for i = 1, 6 do
+      if x:sub(i, i) == "1" then
+        c = c + 2 ^ (6 - i)
+      end
+    end
+    return B64:sub(c + 1, c + 1)
+  end)
+
+  local pad = ({ "", "==", "=" })[(#data % 3) + 1]
+  return s .. pad
+end
+
+local function b64dec(data)
+  data = data or ""
+  data = data:gsub("%s+", "")
+  if data == "" then return "" end
+  if data:find("[^" .. B64 .. "=]") then return nil end
+
+  local s = data:gsub(".", function(x)
+    if x == "=" then return "" end
+    local f = B64:find(x, 1, true)
+    if not f then return "" end
+    f = f - 1
+    local bits = ""
+    for i = 6, 1, -1 do
+      local p = 2 ^ (i - 1)
+      bits = bits .. ((f >= p) and "1" or "0")
+      if f >= p then f = f - p end
+    end
+    return bits
+  end)
+
+  local out = s:gsub("%d%d%d%d%d%d%d%d", function(x)
+    local c = 0
+    for i = 1, 8 do
+      if x:sub(i, i) == "1" then
+        c = c + 2 ^ (8 - i)
+      end
+    end
+    return string.char(c)
+  end)
+
+  return out
+end
+
+-- =========================
+-- Bundle Export / Import
+-- =========================
+local EXPORT_MAGIC = "CDMPVEXP1"
+
+local function NormalizeProfile(p)
+  if not p then return end
+  if p.name == nil then p.name = "" end
+  if p.text == nil then p.text = "" end
+  if p.lastPasted == nil then p.lastPasted = 0 end
+  if p.lastSavedName == nil then p.lastSavedName = p.name end
+  if p.lastSavedText == nil then p.lastSavedText = p.text end
+  if p.sharedFrom == nil then p.sharedFrom = nil end
+  if p.sharedAt == nil then p.sharedAt = nil end
+end
+
+local function SafetyRestoreProfileIfEmptied(p)
+  if not p then return end
+  NormalizeProfile(p)
+  if p.name == "" and (p.lastSavedName or "") ~= "" then p.name = p.lastSavedName end
+  if p.text == "" and (p.lastSavedText or "") ~= "" then p.text = p.lastSavedText end
+end
+
+local function EnsureProfilesForClass(className)
+  DB.classes[className] = DB.classes[className] or { profiles = {} }
+  DB.classes[className].profiles = DB.classes[className].profiles or {}
+  local profiles = DB.classes[className].profiles
+  for i = 1, #profiles do NormalizeProfile(profiles[i]) end
+  return profiles
+end
+
+local function FindProfileIndexByName(className, name)
+  if not name or name == "" then return nil end
+  local profiles = EnsureProfilesForClass(className)
+  for i = 1, #profiles do
+    local p = profiles[i]
+    if p and (p.name or "") == name then
+      return i
+    end
+  end
+  return nil
+end
+
+local function ExportBundle(scope, onlyClassName)
+  scope = scope or "CLASS"
+
+  local classesToExport = {}
+  if scope == "ALL" then
+    for _, cn in ipairs(CLASSES) do
+      classesToExport[#classesToExport + 1] = cn
+    end
+  else
+    classesToExport[1] = onlyClassName
+  end
+
+  local out = {}
+  out[#out + 1] = EXPORT_MAGIC
+  out[#out + 1] = scope
+  out[#out + 1] = tostring(#classesToExport)
+
+  for _, className in ipairs(classesToExport) do
+    local profiles = EnsureProfilesForClass(className)
+
+    out[#out + 1] = "C"
+    out[#out + 1] = b64enc(className)
+    out[#out + 1] = tostring(#profiles)
+
+    for i = 1, #profiles do
+      local p = profiles[i]
+      NormalizeProfile(p)
+
+      out[#out + 1] = "P"
+      out[#out + 1] = b64enc(p.name or "")
+      out[#out + 1] = b64enc(p.text or "")
+      out[#out + 1] = tostring(p.lastPasted or 0)
+      out[#out + 1] = b64enc(p.sharedFrom or "")
+      out[#out + 1] = tostring(p.sharedAt or 0)
+    end
+  end
+
+  return table.concat(out, "|")
+end
+
+local function ParseNextField(s, idx)
+  local j = s:find("|", idx, true)
+  if not j then return nil, nil end
+  local field = s:sub(idx, j - 1)
+  return field, j + 1
+end
+
+-- opts: { sharedFrom=string|nil, sharedAt=number|nil, setLastPasted=number|nil }
+local function ImportBundle(bundleString, opts)
+  opts = opts or {}
+  local forceSharedFrom = opts.sharedFrom
+  local forceSharedAt = opts.sharedAt
+  local forceLastPasted = opts.setLastPasted
+
+  local s = Trim(bundleString or "")
+  if s == "" then return false, "Empty import string." end
+  if s:sub(-1) ~= "|" then s = s .. "|" end
+
+  local idx = 1
+  local function nextField()
+    local f
+    f, idx = ParseNextField(s, idx)
+    return f
+  end
+
+  local magic = nextField()
+  if magic ~= EXPORT_MAGIC then
+    return false, "Not a CDMProfileVault export string."
+  end
+
+  local scope = nextField()
+  local classCount = tonumber(nextField() or "0") or 0
+  if classCount <= 0 then
+    return false, "Export string has no classes."
+  end
+
+  local importedProfiles = 0
+
+  for _ = 1, classCount do
+    local tag = nextField()
+    if tag ~= "C" then
+      return false, "Corrupt export (expected class tag)."
+    end
+
+    local classNameB64 = nextField() or ""
+    local className = b64dec(classNameB64)
+    if not className or className == "" then
+      return false, "Corrupt export (bad class name)."
+    end
+
+    local profCount = tonumber(nextField() or "0") or 0
+    local profiles = EnsureProfilesForClass(className)
+
+    for __ = 1, profCount do
+      local ptag = nextField()
+      if ptag ~= "P" then
+        return false, "Corrupt export (expected profile tag)."
+      end
+
+      local name = b64dec(nextField() or "")
+      local text = b64dec(nextField() or "")
+      local lastPasted = tonumber(nextField() or "0") or 0
+      local sharedFrom = b64dec(nextField() or "")
+      local sharedAt = tonumber(nextField() or "0") or 0
+
+      if name == nil then name = "" end
+      if text == nil then text = "" end
+      if sharedFrom == nil or sharedFrom == "" then sharedFrom = nil end
+      if sharedAt <= 0 then sharedAt = nil end
+
+      if forceSharedFrom then sharedFrom = forceSharedFrom end
+      if forceSharedAt then sharedAt = forceSharedAt end
+      if forceLastPasted then lastPasted = forceLastPasted end
+
+      local existingIdx = FindProfileIndexByName(className, name)
+      if existingIdx then
+        local ep = profiles[existingIdx]
+        NormalizeProfile(ep)
+        ep.name = name
+        ep.text = text
+        ep.lastPasted = lastPasted
+        ep.lastSavedName = name
+        ep.lastSavedText = text
+        ep.sharedFrom = sharedFrom
+        ep.sharedAt = sharedAt
+      else
+        local np = {
+          name = name,
+          text = text,
+          lastPasted = lastPasted,
+          lastSavedName = name,
+          lastSavedText = text,
+          sharedFrom = sharedFrom,
+          sharedAt = sharedAt,
+        }
+        NormalizeProfile(np)
+        profiles[#profiles + 1] = np
+      end
+
+      importedProfiles = importedProfiles + 1
+    end
+  end
+
+  return true, "Imported " .. importedProfiles .. " profiles."
+end
+
+-- =========================
+-- DB init / restore
+-- =========================
+local function InitDB()
+  _G[SV_NAME] = _G[SV_NAME] or {}
+  DB = DeepCopyDefaults(DEFAULTS, _G[SV_NAME])
+
+  DB.classes = DB.classes or {}
+  for _, className in ipairs(CLASSES) do
+    DB.classes[className] = DB.classes[className] or { profiles = {} }
+    DB.classes[className].profiles = DB.classes[className].profiles or {}
+    for i = 1, #(DB.classes[className].profiles) do
+      NormalizeProfile(DB.classes[className].profiles[i])
+    end
+  end
+end
+
+local function RestoreAllProfilesIfEmptied()
+  if not DB or not DB.classes then return end
+  for _, className in ipairs(CLASSES) do
+    local c = DB.classes[className]
+    if c and c.profiles then
+      for i = 1, #c.profiles do
+        SafetyRestoreProfileIfEmptied(c.profiles[i])
+      end
+    end
+  end
+end
+
+-- =========================
 -- Style helpers
 -- =========================
 local function AddToUISpecialFrames(frameName)
@@ -292,61 +587,6 @@ local function StripInputBoxArt(editbox)
 end
 
 -- =========================
--- Profile safety system
--- =========================
-local function NormalizeProfile(p)
-  if not p then return end
-  if p.name == nil then p.name = "" end
-  if p.text == nil then p.text = "" end
-  if p.lastPasted == nil then p.lastPasted = 0 end
-  if p.lastSavedName == nil then p.lastSavedName = p.name end
-  if p.lastSavedText == nil then p.lastSavedText = p.text end
-  if p.sharedFrom == nil then p.sharedFrom = nil end
-  if p.sharedAt == nil then p.sharedAt = nil end
-end
-
-local function SafetyRestoreProfileIfEmptied(p)
-  if not p then return end
-  NormalizeProfile(p)
-  if p.name == "" and (p.lastSavedName or "") ~= "" then p.name = p.lastSavedName end
-  if p.text == "" and (p.lastSavedText or "") ~= "" then p.text = p.lastSavedText end
-end
-
-local function InitDB()
-  _G[SV_NAME] = _G[SV_NAME] or {}
-  DB = DeepCopyDefaults(DEFAULTS, _G[SV_NAME])
-
-  DB.classes = DB.classes or {}
-  for _, className in ipairs(CLASSES) do
-    DB.classes[className] = DB.classes[className] or { profiles = {} }
-    DB.classes[className].profiles = DB.classes[className].profiles or {}
-    for i = 1, #(DB.classes[className].profiles) do
-      NormalizeProfile(DB.classes[className].profiles[i])
-    end
-  end
-end
-
-local function EnsureProfilesForClass(className)
-  DB.classes[className] = DB.classes[className] or { profiles = {} }
-  DB.classes[className].profiles = DB.classes[className].profiles or {}
-  local profiles = DB.classes[className].profiles
-  for i = 1, #profiles do NormalizeProfile(profiles[i]) end
-  return profiles
-end
-
-local function RestoreAllProfilesIfEmptied()
-  if not DB or not DB.classes then return end
-  for _, className in ipairs(CLASSES) do
-    local c = DB.classes[className]
-    if c and c.profiles then
-      for i = 1, #c.profiles do
-        SafetyRestoreProfileIfEmptied(c.profiles[i])
-      end
-    end
-  end
-end
-
--- =========================
 -- Minimap button
 -- =========================
 local MinimapButton
@@ -413,7 +653,7 @@ local function CreateMinimapButton(toggleMainFrameFunc)
 end
 
 -- =========================
--- Dropdown helper (class only)
+-- Dropdown helper
 -- =========================
 local function CreateDropdownButton(parent, width, height)
   local ok, dd = pcall(CreateFrame, "DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
@@ -464,6 +704,7 @@ local UI = {
 
   expectingPaste = false,
   copyFrame = nil,
+  importFrame = nil,
 }
 
 local ROW_H = 24
@@ -652,7 +893,6 @@ end
 -- =========================
 -- StaticPopups (overwrite every load)
 -- =========================
-
 StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = {
   text = "Delete profile '%s'?",
   button1 = "Delete",
@@ -680,7 +920,7 @@ StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = {
 }
 
 StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = {
-  text = "Share this profile.\n\nEnter player name (Name-Realm) to whisper.\nLeave blank to send to Party/Raid.",
+  text = "Share.\n\nEnter player name (Name-Realm) to whisper.\nLeave blank to send to Party/Raid.\n\nTip: Shift+Share = class bundle. Ctrl+Shift+Share = all classes.",
   button1 = "Send",
   button2 = "Cancel",
   hasEditBox = true,
@@ -731,7 +971,8 @@ StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = {
       end
     end
 
-    StartShare(data.payload.className, data.payload.profileName, data.payload.text, channel, whisperTarget)
+    local pl = data.payload
+    StartShare(pl.kind, pl.className, pl.profileName, pl.text, channel, whisperTarget)
   end,
 
   EditBoxOnEnterPressed = function(editBox)
@@ -752,7 +993,6 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = {
   hideOnEscape = true,
   preferredIndex = 3,
 
-  -- FIX: some builds have self.Text not self.text
   OnShow = function(self)
     if not PendingAccept then return end
     local who = Ambiguate(PendingAccept.from or "?", "short")
@@ -761,8 +1001,9 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = {
     if not textRegion then return end
 
     textRegion:SetText(
-      "Accept profile from:\n\n" .. who ..
-      "\n\nClass: " .. (PendingAccept.className or "?") ..
+      "Accept from:\n\n" .. who ..
+      "\n\nType: " .. KindLabel(PendingAccept.kind) ..
+      "\nClass: " .. (PendingAccept.className or "?") ..
       "\nName: " .. (PendingAccept.profileName or "?")
     )
   end,
@@ -770,39 +1011,57 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = {
   OnAccept = function()
     if not PendingAccept then return end
 
-    local id = PendingAccept.id
+    local kind = PendingAccept.kind or "PROFILE"
     local className = PendingAccept.className
     local profName = PendingAccept.profileName
     local text = PendingAccept.text
     local from = PendingAccept.from
+    local now = time()
 
-    if not className or not DB.classes or not DB.classes[className] then
-      print("CDMProfileVault: Could not import (unknown class).")
-      PendingAccept = nil
-      return
+    if kind == "PROFILE" then
+      if not className or not DB.classes or not DB.classes[className] then
+        print("CDMProfileVault: Could not import (unknown class).")
+        PendingAccept = nil
+        return
+      end
+
+      local profiles = EnsureProfilesForClass(className)
+      local p = {
+        name = profName or "Shared Profile",
+        text = text or "",
+        lastPasted = now,
+        lastSavedName = profName or "Shared Profile",
+        lastSavedText = text or "",
+        sharedFrom = from,
+        sharedAt = now,
+      }
+      NormalizeProfile(p)
+      table.insert(profiles, p)
+
+      print("CDMProfileVault: Imported shared profile from " .. Ambiguate(from or "?", "short") .. ".")
+    else
+      local ok, msg = ImportBundle(text or "", {
+        sharedFrom = from,
+        sharedAt = now,
+        setLastPasted = now,
+      })
+
+      if ok then
+        print("CDMProfileVault: Imported " .. KindLabel(kind) .. " from " .. Ambiguate(from or "?", "short") .. ". " .. msg)
+      else
+        print("CDMProfileVault: Bundle import failed: " .. (msg or "Unknown error"))
+      end
     end
 
-    local profiles = EnsureProfilesForClass(className)
-    local p = {
-      name = profName or "Shared Profile",
-      text = text or "",
-      lastPasted = time(),
-      lastSavedName = profName or "Shared Profile",
-      lastSavedText = text or "",
-      sharedFrom = from,
-      sharedAt = time(),
-    }
-    NormalizeProfile(p)
-    table.insert(profiles, p)
-
-    print("CDMProfileVault: Imported shared profile from " .. Ambiguate(from or "?", "short") .. ".")
-
-    -- IMPORTANT: do NOT clear CompletedShares[id] anymore (so links don't "expire")
-    -- if id then CompletedShares[id] = nil end
+    -- Do NOT clear CompletedShares[id] (so the link doesn't "expire")
+    -- if PendingAccept.id then CompletedShares[PendingAccept.id] = nil end
 
     if UI.frame and UI.frame:IsShown() then
-      SelectClass(className)
-      UI.selectedProfileIndex = #EnsureProfilesForClass(className)
+      if kind == "BUNDLE_CLASS" and className and DB.classes and DB.classes[className] then
+        SelectClass(className)
+        local profiles = EnsureProfilesForClass(className)
+        UI.selectedProfileIndex = (#profiles > 0) and #profiles or nil
+      end
       UpdateEditor()
       RefreshList()
     end
@@ -860,9 +1119,9 @@ local function SetupClassDropdown(parent, labelFrame)
 end
 
 -- =========================
--- Copy popup
+-- Copy/Export popup
 -- =========================
-local function ShowCopyFrame(text)
+local function ShowCopyFrame(text, titleText)
   if not UI.copyFrame then
     local f = CreateFrame("Frame", "CDMProfileVaultCopyFrame", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
     f:SetSize(560, 320)
@@ -879,7 +1138,8 @@ local function ShowCopyFrame(text)
 
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     title:SetPoint("TOPLEFT", 12, -10)
-    title:SetText("Copy String (Ctrl+C)")
+    title:SetText("Copy (Ctrl+C)")
+    f.title = title
 
     local sf = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
     sf:SetPoint("TOPLEFT", 12, -34)
@@ -899,10 +1159,89 @@ local function ShowCopyFrame(text)
     UI.copyFrame = f
   end
 
+  UI.copyFrame.title:SetText(titleText or "Copy (Ctrl+C)")
   UI.copyFrame:Show()
   UI.copyFrame.editBox:SetText(text or "")
   UI.copyFrame.editBox:SetFocus()
   UI.copyFrame.editBox:HighlightText()
+end
+
+-- =========================
+-- Import popup (Shift+Paste)
+-- =========================
+local function ShowImportFrame()
+  if not UI.importFrame then
+    local f = CreateFrame("Frame", "CDMProfileVaultImportFrame", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
+    f:SetSize(560, 360)
+    f:SetPoint("CENTER")
+    f:SetFrameStrata("DIALOG")
+    f:Hide()
+
+    ApplyFlatBackground(f, 0.18, 0.18, 0.18, 1.0)
+    ApplySharpBorder(f, 2)
+    AddToUISpecialFrames("CDMProfileVaultImportFrame")
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", -4, -4)
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    title:SetPoint("TOPLEFT", 12, -10)
+    title:SetText("Import Bundle")
+    f.title = title
+
+    local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    hint:SetPoint("TOPLEFT", 12, -28)
+    hint:SetText("Paste a CDMProfileVault export string here, then click Import.")
+
+    local sf = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
+    sf:SetPoint("TOPLEFT", 12, -48)
+    sf:SetPoint("BOTTOMRIGHT", -34, 48)
+
+    local eb = CreateFrame("EditBox", nil, sf)
+    eb:SetMultiLine(true)
+    eb:SetFontObject("ChatFontNormal")
+    eb:SetWidth(500)
+    eb:SetAutoFocus(true)
+    eb:EnableMouse(true)
+    eb:SetScript("OnEscapePressed", function() f:Hide() end)
+
+    sf:SetScrollChild(eb)
+    f.editBox = eb
+
+    local importBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    importBtn:SetSize(100, 26)
+    importBtn:SetPoint("BOTTOMRIGHT", -12, 12)
+    importBtn:SetText("Import")
+
+    local cancelBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    cancelBtn:SetSize(100, 26)
+    cancelBtn:SetPoint("RIGHT", importBtn, "LEFT", -8, 0)
+    cancelBtn:SetText("Cancel")
+
+    cancelBtn:SetScript("OnClick", function() f:Hide() end)
+
+    importBtn:SetScript("OnClick", function()
+      local text = eb:GetText() or ""
+      local ok, msg = ImportBundle(text)
+      if ok then
+        print("CDMProfileVault: " .. msg)
+        eb:SetText("")
+        f:Hide()
+        if UI.frame and UI.frame:IsShown() then
+          RefreshList()
+          UpdateEditor()
+        end
+      else
+        print("CDMProfileVault: Import failed - " .. (msg or "Unknown error"))
+      end
+    end)
+
+    UI.importFrame = f
+  end
+
+  UI.importFrame:Show()
+  UI.importFrame.editBox:SetFocus()
+  UI.importFrame.editBox:HighlightText()
 end
 
 -- =========================
@@ -1181,6 +1520,11 @@ local function CreateUI()
   pasteBtn:SetText("Paste")
   UI.pasteBtn = pasteBtn
   pasteBtn:SetScript("OnClick", function()
+    if IsShiftKeyDown() then
+      ShowImportFrame()
+      return
+    end
+
     if not UI.selectedProfileIndex then return end
     UI.expectingPaste = true
     UI.textEdit:SetFocus()
@@ -1194,10 +1538,19 @@ local function CreateUI()
   copyBtn:SetText("Copy")
   UI.copyBtn = copyBtn
   copyBtn:SetScript("OnClick", function()
+    if IsShiftKeyDown() then
+      local scope = (IsControlKeyDown() and "ALL") or "CLASS"
+      local bundle = ExportBundle(scope, UI.selectedClass)
+      local titleText = (scope == "ALL") and "Export ALL (Ctrl+C)" or ("Export " .. UI.selectedClass .. " (Ctrl+C)")
+      ShowCopyFrame(bundle, titleText)
+      print("CDMProfileVault: Export created (" .. scope .. ").")
+      return
+    end
+
     local p = GetSelectedProfile()
     if not p then return end
     SafetyRestoreProfileIfEmptied(p)
-    ShowCopyFrame(p.text or "")
+    ShowCopyFrame(p.text or "", "Copy String (Ctrl+C)")
   end)
 
   local shareBtn = CreateFrame("Button", nil, right, "UIPanelButtonTemplate")
@@ -1206,17 +1559,6 @@ local function CreateUI()
   shareBtn:SetText("Share")
   UI.shareBtn = shareBtn
   shareBtn:SetScript("OnClick", function()
-    local p = GetSelectedProfile()
-    if not p then return end
-    SafetyRestoreProfileIfEmptied(p)
-
-    local profileName = (p.name and p.name ~= "" and p.name) or ("Profile " .. UI.selectedProfileIndex)
-    local payload = p.text or ""
-    if payload == "" then
-      print("CDMProfileVault: Nothing to share (empty string).")
-      return
-    end
-
     local defaultTarget = ""
     if UnitExists("target") and UnitIsPlayer("target") then
       local n, r = UnitName("target")
@@ -1224,9 +1566,41 @@ local function CreateUI()
       elseif n then defaultTarget = n end
     end
 
+    local kind = "PROFILE"
+    local className = UI.selectedClass
+    local profileName = nil
+    local payloadText = nil
+
+    if IsShiftKeyDown() then
+      if IsControlKeyDown() then
+        kind = "BUNDLE_ALL"
+        className = "All Classes"
+        profileName = "Vault Export"
+        payloadText = ExportBundle("ALL", UI.selectedClass)
+      else
+        kind = "BUNDLE_CLASS"
+        className = UI.selectedClass
+        profileName = UI.selectedClass .. " Export"
+        payloadText = ExportBundle("CLASS", UI.selectedClass)
+      end
+    else
+      local p = GetSelectedProfile()
+      if not p then
+        print("CDMProfileVault: Select a profile to share (or Shift+Share for a bundle).")
+        return
+      end
+      SafetyRestoreProfileIfEmptied(p)
+      profileName = (p.name and p.name ~= "" and p.name) or ("Profile " .. UI.selectedProfileIndex)
+      payloadText = p.text or ""
+      if payloadText == "" then
+        print("CDMProfileVault: Nothing to share (empty string).")
+        return
+      end
+    end
+
     StaticPopup_Show("CDM_PROFILEVAULT_SHARE_TO", nil, nil, {
       defaultTarget = defaultTarget,
-      payload = { className = UI.selectedClass, profileName = profileName, text = payload },
+      payload = { kind = kind, className = className, profileName = profileName, text = payloadText },
     })
   end)
 
@@ -1285,6 +1659,7 @@ local function HandleShareLinkClick(id)
   PendingAccept = {
     id = id,
     from = data.from,
+    kind = data.kind,
     className = data.className,
     profileName = data.profileName,
     text = data.text,
@@ -1319,14 +1694,30 @@ local function OnAddonMessage(prefix, msg, channel, sender)
   local typ = msg:sub(1, 1)
 
   if typ == "M" then
-    local _, id, className, profileName, total = strsplit(SEP, msg, 5)
+    -- v2: M id kind class name total
+    local a, id, kind, className, profileName, total = strsplit(SEP, msg, 6)
+
+    -- Backward fallback (older format): M id class name total
+    if not total then
+      local _, id2, class2, name2, total2 = strsplit(SEP, msg, 5)
+      id = id2
+      kind = "PROFILE"
+      className = class2
+      profileName = name2
+      total = total2
+    end
+
     total = tonumber(total or "0") or 0
     if not id or id == "" or total <= 0 then return end
+    if kind ~= "PROFILE" and kind ~= "BUNDLE_CLASS" and kind ~= "BUNDLE_ALL" then
+      kind = "PROFILE"
+    end
 
     PendingIncoming[id] = {
       from = sender,
+      kind = kind,
       className = className or "Unknown",
-      profileName = profileName or "Shared Profile",
+      profileName = profileName or "Shared",
       total = total,
       parts = {},
       got = {},
@@ -1357,6 +1748,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
       if ch == "PARTY" or ch == "RAID" or ch == "WHISPER" or ch == "INSTANCE_CHAT" then
         CompletedShares[id] = {
           from = p.from,
+          kind = p.kind,
           className = p.className,
           profileName = p.profileName,
           text = full,
@@ -1365,8 +1757,9 @@ local function OnAddonMessage(prefix, msg, channel, sender)
 
         local who = Ambiguate(p.from, "short")
         ChatPrint(string.format(
-          "|cff00ff00[CDMProfileVault]|r %s shared: %s / %s %s",
+          "|cff00ff00[CDMProfileVault]|r %s shared %s: %s / %s %s",
           who,
+          KindLabel(p.kind),
           p.className or "?",
           p.profileName or "?",
           ShareLink(id)
