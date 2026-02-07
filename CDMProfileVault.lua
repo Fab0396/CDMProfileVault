@@ -8,9 +8,9 @@ local SV_NAME = "CDMProfileVaultDB"
 -- Addon comms (share/import)
 -- =========================
 local COMM_PREFIX = "CDMPV1"
-local SEP = "\31" -- Unit Separator (safe)
-local CHUNK_SIZE = 220
-local SEND_INTERVAL = 0.02
+local SEP = "\t"            -- SAFE delimiter
+local SEND_INTERVAL = 0.06
+local SAFE_MAX = 240        -- keep under 255
 
 local PendingIncoming = {}   -- [id] = {from, kind, className, profileName, total, parts={}, got={}, gotCount=0, recvChannel}
 local CompletedShares = {}   -- [id] = {from, kind, className, profileName, text, receivedAt}
@@ -57,9 +57,7 @@ local function EnqueueSend(channel, target, msg)
       return
     end
     local item = table.remove(sendQueue, 1)
-    if item then
-      SafeSendAddonMessage(item.msg, item.ch, item.to)
-    end
+    if item then SafeSendAddonMessage(item.msg, item.ch, item.to) end
   end)
 end
 
@@ -74,10 +72,13 @@ local function Trim(s)
   return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
-local function SanitizeField(s)
+local function CleanMetaField(s)
   s = s or ""
+  s = s:gsub("[%z%c]", "")     -- remove NUL + control chars
   s = s:gsub("\n", " ")
-  return s
+  s = s:gsub("\r", " ")
+  s = s:gsub("\t", " ")
+  return Trim(s)
 end
 
 local function ChatPrint(msg)
@@ -104,32 +105,56 @@ local function KindLabel(kind)
   return "Profile"
 end
 
--- kind: "PROFILE" | "BUNDLE_CLASS" | "BUNDLE_ALL"
+-- Build parts so that each "D" message is <= 255 chars
+local function SplitForAddonMessages(id, text)
+  local parts = {}
+  if not text or text == "" then return parts end
+
+  local idLen = #id
+  local pos = 1
+  local idx = 1
+
+  while pos <= #text do
+    local idxLen = #tostring(idx)
+    -- "D" + SEP + id + SEP + idx + SEP + payload
+    local overhead = 1 + 3 + idLen + idxLen
+    local payloadMax = SAFE_MAX - overhead
+    if payloadMax < 60 then payloadMax = 60 end
+    parts[#parts + 1] = text:sub(pos, pos + payloadMax - 1)
+    pos = pos + payloadMax
+    idx = idx + 1
+  end
+
+  return parts
+end
+
 local function StartShare(kind, className, profileName, text, channel, target)
   kind = kind or "PROFILE"
 
   if not text or text == "" then
-    print("CDMProfileVault: Nothing to share (empty string).")
+    print("CDMProfileVault: Nothing to share (empty).")
     return
   end
 
   EnsurePrefixRegistered()
 
   local id = MakeShareId()
-  className = SanitizeField(className)
-  profileName = SanitizeField(profileName)
+  className = CleanMetaField(className)
+  profileName = CleanMetaField(profileName)
 
-  local parts = {}
-  for i = 1, #text, CHUNK_SIZE do
-    parts[#parts + 1] = text:sub(i, i + CHUNK_SIZE - 1)
+  local parts = SplitForAddonMessages(id, text)
+  if #parts == 0 then
+    print("CDMProfileVault: Nothing to share (empty).")
+    return
   end
 
-  -- META (v2): M<SEP>id<SEP>kind<SEP>class<SEP>name<SEP>totalParts
+  -- META: M<TAB>id<TAB>kind<TAB>class<TAB>name<TAB>totalParts
   EnqueueSend(channel, target, table.concat({ "M", id, kind, className, profileName, tostring(#parts) }, SEP))
 
-  -- DATA: D<SEP>id<SEP>idx<SEP>payload
+  -- DATA: D<TAB>id<TAB>idx<TAB>payload
   for idx, chunk in ipairs(parts) do
-    EnqueueSend(channel, target, table.concat({ "D", id, tostring(idx), chunk }, SEP))
+    local msg = table.concat({ "D", id, tostring(idx), chunk }, SEP)
+    EnqueueSend(channel, target, msg)
   end
 
   if channel == "WHISPER" then
@@ -192,7 +217,6 @@ local function ClassIconMarkup(className, size)
   local r = math.floor(c[2] * CLASS_ICON_TEX_W + 0.5)
   local t = math.floor(c[3] * CLASS_ICON_TEX_H + 0.5)
   local b = math.floor(c[4] * CLASS_ICON_TEX_H + 0.5)
-
   size = size or 16
   return string.format("|T%s:%d:%d:0:0:%d:%d:%d:%d:%d:%d|t",
     CLASS_ICON_TEXTURE, size, size,
@@ -201,7 +225,7 @@ local function ClassIconMarkup(className, size)
   )
 end
 
-local FIXED_DATE_FORMAT = "%d %b %Y"
+local FIXED_DATE_FORMAT = "%d/%b/%Y" -- DD/MON/YYYY
 
 local DEFAULTS = {
   settings = {
@@ -230,80 +254,44 @@ local function FormatTimestamp(ts)
   return date(FIXED_DATE_FORMAT, ts)
 end
 
--- =========================
--- Base64 (bundle import/export)
--- =========================
-local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-local function b64enc(data)
-  data = data or ""
-  if data == "" then return "" end
-
-  local s = data:gsub(".", function(x)
-    local byte = x:byte()
-    local bits = ""
-    for i = 8, 1, -1 do
-      local p = 2 ^ (i - 1)
-      bits = bits .. ((byte >= p) and "1" or "0")
-      if byte >= p then byte = byte - p end
-    end
-    return bits
-  end)
-
-  s = s .. "0000"
-  s = s:gsub("%d%d%d?%d?%d?%d?", function(x)
-    if #x < 6 then return "" end
-    local c = 0
-    for i = 1, 6 do
-      if x:sub(i, i) == "1" then
-        c = c + 2 ^ (6 - i)
-      end
-    end
-    return B64:sub(c + 1, c + 1)
-  end)
-
-  local pad = ({ "", "==", "=" })[(#data % 3) + 1]
-  return s .. pad
+local function IsKnownClassDisplay(name)
+  return (name and CLASS_FILE[name]) ~= nil
 end
 
-local function b64dec(data)
-  data = data or ""
-  data = data:gsub("%s+", "")
-  if data == "" then return "" end
-  if data:find("[^" .. B64 .. "=]") then return nil end
+local function NormalizeClassName(s)
+  s = Trim((s or ""):gsub("[%z%c]", "")) -- drop NUL/control
+  if s == "" then return nil end
+  if IsKnownClassDisplay(s) then return s end
 
-  local s = data:gsub(".", function(x)
-    if x == "=" then return "" end
-    local f = B64:find(x, 1, true)
-    if not f then return "" end
-    f = f - 1
-    local bits = ""
-    for i = 6, 1, -1 do
-      local p = 2 ^ (i - 1)
-      bits = bits .. ((f >= p) and "1" or "0")
-      if f >= p then f = f - p end
+  local stripped = Trim(s:gsub("[%s%d]+$", ""))
+  if IsKnownClassDisplay(stripped) then return stripped end
+
+  local u = stripped:upper():gsub("%s+", "")
+  for disp, file in pairs(CLASS_FILE) do
+    if file == u then return disp end
+  end
+
+  local letters = stripped:gsub("[^A-Za-z]", ""):lower()
+  for _, disp in ipairs(CLASSES) do
+    if disp:gsub("[^A-Za-z]", ""):lower() == letters then
+      return disp
     end
-    return bits
-  end)
+  end
+  return nil
+end
 
-  local out = s:gsub("%d%d%d%d%d%d%d%d", function(x)
-    local c = 0
-    for i = 1, 8 do
-      if x:sub(i, i) == "1" then
-        c = c + 2 ^ (8 - i)
-      end
-    end
-    return string.char(c)
-  end)
+local function CleanProfileName(s)
+  s = (s or ""):gsub("[%z%c]", "")
+  return Trim(s)
+end
 
-  return out
+local function CleanTextNoNulls(s)
+  return (s or ""):gsub("[%z]", "")
 end
 
 -- =========================
--- Bundle Export / Import
+-- Profiles + DB helpers
 -- =========================
-local EXPORT_MAGIC = "CDMPVEXP1"
-
 local function NormalizeProfile(p)
   if not p then return end
   if p.name == nil then p.name = "" end
@@ -313,6 +301,11 @@ local function NormalizeProfile(p)
   if p.lastSavedText == nil then p.lastSavedText = p.text end
   if p.sharedFrom == nil then p.sharedFrom = nil end
   if p.sharedAt == nil then p.sharedAt = nil end
+
+  p.name = CleanProfileName(p.name)
+  p.lastSavedName = CleanProfileName(p.lastSavedName)
+  p.text = CleanTextNoNulls(p.text)
+  p.lastSavedText = CleanTextNoNulls(p.lastSavedText)
 end
 
 local function SafetyRestoreProfileIfEmptied(p)
@@ -335,63 +328,286 @@ local function FindProfileIndexByName(className, name)
   local profiles = EnsureProfilesForClass(className)
   for i = 1, #profiles do
     local p = profiles[i]
-    if p and (p.name or "") == name then
-      return i
-    end
+    if p and (p.name or "") == name then return i end
   end
   return nil
 end
+
+local function MakeUniqueName(className, baseName, used)
+  baseName = Trim(baseName or "")
+  if baseName == "" then baseName = "Imported Profile" end
+  used = used or {}
+
+  local function isTaken(n)
+    if used[n] then return true end
+    return FindProfileIndexByName(className, n) ~= nil
+  end
+
+  if not isTaken(baseName) then used[baseName] = true; return baseName end
+  for i = 2, 999 do
+    local c = string.format("%s (%d)", baseName, i)
+    if not isTaken(c) then used[c] = true; return c end
+  end
+  used[baseName] = true
+  return baseName
+end
+
+-- =========================
+-- Bundle Export / Import (CDMPVEXP2)
+-- =========================
+local EXPORT_MAGIC2 = "CDMPVEXP2"
+local EXPORT_MAGIC1 = "CDMPVEXP1"
 
 local function ExportBundle(scope, onlyClassName)
   scope = scope or "CLASS"
 
   local classesToExport = {}
   if scope == "ALL" then
-    for _, cn in ipairs(CLASSES) do
-      classesToExport[#classesToExport + 1] = cn
-    end
+    for _, cn in ipairs(CLASSES) do classesToExport[#classesToExport + 1] = cn end
   else
     classesToExport[1] = onlyClassName
   end
 
   local out = {}
-  out[#out + 1] = EXPORT_MAGIC
-  out[#out + 1] = scope
-  out[#out + 1] = tostring(#classesToExport)
+  out[#out + 1] = EXPORT_MAGIC2 .. "\n"
+  out[#out + 1] = scope .. "\n"
+  out[#out + 1] = tostring(#classesToExport) .. "\n"
 
   for _, className in ipairs(classesToExport) do
     local profiles = EnsureProfilesForClass(className)
 
-    out[#out + 1] = "C"
-    out[#out + 1] = b64enc(className)
-    out[#out + 1] = tostring(#profiles)
+    out[#out + 1] = "CLASS\n"
+    out[#out + 1] = className .. "\n"
+    out[#out + 1] = tostring(#profiles) .. "\n"
 
     for i = 1, #profiles do
       local p = profiles[i]
       NormalizeProfile(p)
 
-      out[#out + 1] = "P"
-      out[#out + 1] = b64enc(p.name or "")
-      out[#out + 1] = b64enc(p.text or "")
-      out[#out + 1] = tostring(p.lastPasted or 0)
-      out[#out + 1] = b64enc(p.sharedFrom or "")
-      out[#out + 1] = tostring(p.sharedAt or 0)
+      local name = p.name or ""
+      local text = p.text or ""
+      local sharedFrom = p.sharedFrom or ""
+      local sharedAt = tonumber(p.sharedAt or 0) or 0
+      local lastPasted = tonumber(p.lastPasted or 0) or 0
+
+      out[#out + 1] = "PROFILE\n"
+
+      out[#out + 1] = tostring(#name) .. "\n"
+      out[#out + 1] = name .. "\n"
+
+      out[#out + 1] = tostring(#text) .. "\n"
+      out[#out + 1] = text .. "\n"
+
+      out[#out + 1] = tostring(lastPasted) .. "\n"
+
+      out[#out + 1] = tostring(#sharedFrom) .. "\n"
+      out[#out + 1] = sharedFrom .. "\n"
+
+      out[#out + 1] = tostring(sharedAt) .. "\n"
     end
   end
 
-  return table.concat(out, "|")
+  return table.concat(out, "")
 end
 
-local function ParseNextField(s, idx)
-  local j = s:find("|", idx, true)
+local function ReadLine(s, i)
+  local j = s:find("\n", i, true)
   if not j then return nil, nil end
-  local field = s:sub(idx, j - 1)
-  return field, j + 1
+  return s:sub(i, j - 1), j + 1
 end
 
--- opts: { sharedFrom=string|nil, sharedAt=number|nil, setLastPasted=number|nil }
-local function ImportBundle(bundleString, opts)
+local function ReadNumberLine(s, i)
+  local line; line, i = ReadLine(s, i)
+  if not line then return nil, nil end
+  local n = tonumber(line)
+  if not n then return nil, nil end
+  return n, i
+end
+
+local function ReadBytesLine(s, i, n)
+  if n < 0 then return nil, nil end
+  local j = i + n - 1
+  if j > #s then return nil, nil end
+  local bytes = s:sub(i, j)
+  local nl = s:sub(j + 1, j + 1)
+  if nl ~= "\n" then return nil, nil end
+  return bytes, j + 2
+end
+
+local function GetFirstClassFromBundle(bundleString)
+  local s = bundleString or ""
+  if s:sub(1, #EXPORT_MAGIC2) ~= EXPORT_MAGIC2 then return nil end
+  local i = 1
+  local magic; magic, i = ReadLine(s, i); if magic ~= EXPORT_MAGIC2 then return nil end
+  local scope; scope, i = ReadLine(s, i); if not scope then return nil end
+  local classCount; classCount, i = ReadNumberLine(s, i); if not classCount or classCount <= 0 then return nil end
+  local tag; tag, i = ReadLine(s, i); if tag ~= "CLASS" then return nil end
+  local className; className, i = ReadLine(s, i); if not className then return nil end
+  return NormalizeClassName(className)
+end
+
+-- Legacy base64 decode (only for importing CDMPVEXP1)
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function b64dec(data)
+  data = (data or ""):gsub("%s+", "")
+  if data == "" then return "" end
+  if data:find("[^" .. B64 .. "=]") then return nil end
+  local s = data:gsub(".", function(x)
+    if x == "=" then return "" end
+    local f = B64:find(x, 1, true)
+    if not f then return "" end
+    f = f - 1
+    local bits = ""
+    for ii = 6, 1, -1 do
+      local p = 2^(ii-1)
+      bits = bits .. ((f >= p) and "1" or "0")
+      if f >= p then f = f - p end
+    end
+    return bits
+  end)
+  local out = s:gsub("%d%d%d%d%d%d%d%d", function(x)
+    local c = 0
+    for ii = 1, 8 do
+      if x:sub(ii, ii) == "1" then c = c + 2^(8-ii) end
+    end
+    return string.char(c)
+  end)
+  return out
+end
+
+local function ImportBundleV2(bundleString, opts)
   opts = opts or {}
+  local mode = opts.mode or "SMART"
+  local forceSharedFrom = opts.sharedFrom
+  local forceSharedAt = opts.sharedAt
+  local forceLastPasted = opts.setLastPasted
+
+  local s = bundleString or ""
+  if s:sub(1, #EXPORT_MAGIC2) ~= EXPORT_MAGIC2 then
+    return false, "Not a CDMPVEXP2 string."
+  end
+
+  local i = 1
+  local magic; magic, i = ReadLine(s, i)
+  if magic ~= EXPORT_MAGIC2 then return false, "Bad magic." end
+
+  local scope; scope, i = ReadLine(s, i)
+  if not scope then return false, "Missing scope." end
+
+  local classCount; classCount, i = ReadNumberLine(s, i)
+  if not classCount or classCount <= 0 then return false, "No classes in export." end
+
+  local importedProfiles = 0
+  local meta = { lastClass = nil, lastIndex = nil }
+  local usedNamesPerClass = {}
+
+  for _ = 1, classCount do
+    local tag; tag, i = ReadLine(s, i)
+    if tag ~= "CLASS" then return false, "Corrupt export (expected CLASS)." end
+
+    local rawClass; rawClass, i = ReadLine(s, i)
+    if not rawClass then return false, "Corrupt export (missing class name)." end
+    local className = NormalizeClassName(rawClass)
+    if not className then return false, "Unknown class in export: " .. tostring(rawClass) end
+
+    local profCount; profCount, i = ReadNumberLine(s, i)
+    if not profCount or profCount < 0 then return false, "Corrupt export (bad profile count)." end
+
+    local profiles = EnsureProfilesForClass(className)
+    usedNamesPerClass[className] = usedNamesPerClass[className] or {}
+    local used = usedNamesPerClass[className]
+
+    for __ = 1, profCount do
+      local ptag; ptag, i = ReadLine(s, i)
+      if ptag ~= "PROFILE" then return false, "Corrupt export (expected PROFILE)." end
+
+      local nameLen; nameLen, i = ReadNumberLine(s, i)
+      if not nameLen then return false, "Corrupt export (bad name len)." end
+      local name; name, i = ReadBytesLine(s, i, nameLen)
+      if name == nil then return false, "Corrupt export (bad name bytes)." end
+
+      local textLen; textLen, i = ReadNumberLine(s, i)
+      if not textLen then return false, "Corrupt export (bad text len)." end
+      local text; text, i = ReadBytesLine(s, i, textLen)
+      if text == nil then return false, "Corrupt export (bad text bytes)." end
+
+      local lastPasted; lastPasted, i = ReadNumberLine(s, i)
+      if lastPasted == nil then return false, "Corrupt export (bad lastPasted)." end
+
+      local sharedFromLen; sharedFromLen, i = ReadNumberLine(s, i)
+      if sharedFromLen == nil then return false, "Corrupt export (bad sharedFrom len)." end
+      local sharedFrom; sharedFrom, i = ReadBytesLine(s, i, sharedFromLen)
+      if sharedFrom == nil then return false, "Corrupt export (bad sharedFrom bytes)." end
+
+      local sharedAt; sharedAt, i = ReadNumberLine(s, i)
+      if sharedAt == nil then return false, "Corrupt export (bad sharedAt)." end
+
+      name = CleanProfileName(name)
+      text = CleanTextNoNulls(text)
+      sharedFrom = Trim((sharedFrom or ""):gsub("[%z%c]", ""))
+      if sharedFrom == "" then sharedFrom = nil end
+      if sharedAt <= 0 then sharedAt = nil end
+
+      if forceSharedFrom then sharedFrom = forceSharedFrom end
+      if forceSharedAt then sharedAt = forceSharedAt end
+      if forceLastPasted then lastPasted = forceLastPasted end
+
+      if name == "" then name = "Imported Profile" end
+
+      local existingIdx = FindProfileIndexByName(className, name)
+
+      if mode == "OVERWRITE" and existingIdx then
+        local ep = profiles[existingIdx]
+        NormalizeProfile(ep)
+        ep.name, ep.text = name, text
+        ep.lastPasted = lastPasted
+        ep.lastSavedName, ep.lastSavedText = name, text
+        ep.sharedFrom, ep.sharedAt = sharedFrom, sharedAt
+        meta.lastClass, meta.lastIndex = className, existingIdx
+      else
+        if existingIdx then
+          local ep = profiles[existingIdx]
+          NormalizeProfile(ep)
+          if (ep.text or "") == (text or "") then
+            ep.lastPasted = lastPasted
+            ep.sharedFrom, ep.sharedAt = sharedFrom, sharedAt
+            meta.lastClass, meta.lastIndex = className, existingIdx
+          else
+            local unique = MakeUniqueName(className, name, used)
+            local np = {
+              name = unique, text = text,
+              lastPasted = lastPasted,
+              lastSavedName = unique, lastSavedText = text,
+              sharedFrom = sharedFrom, sharedAt = sharedAt,
+            }
+            NormalizeProfile(np)
+            profiles[#profiles + 1] = np
+            meta.lastClass, meta.lastIndex = className, #profiles
+          end
+        else
+          local unique = MakeUniqueName(className, name, used)
+          local np = {
+            name = unique, text = text,
+            lastPasted = lastPasted,
+            lastSavedName = unique, lastSavedText = text,
+            sharedFrom = sharedFrom, sharedAt = sharedAt,
+          }
+          NormalizeProfile(np)
+          profiles[#profiles + 1] = np
+          meta.lastClass, meta.lastIndex = className, #profiles
+        end
+      end
+
+      importedProfiles = importedProfiles + 1
+    end
+  end
+
+  return true, "Imported " .. importedProfiles .. " profiles.", meta
+end
+
+local function ImportBundleV1(bundleString, opts)
+  opts = opts or {}
+  local mode = opts.mode or "SMART"
   local forceSharedFrom = opts.sharedFrom
   local forceSharedAt = opts.sharedAt
   local forceLastPasted = opts.setLastPasted
@@ -400,96 +616,124 @@ local function ImportBundle(bundleString, opts)
   if s == "" then return false, "Empty import string." end
   if s:sub(-1) ~= "|" then s = s .. "|" end
 
+  local function ParseNextField(str, idx)
+    local j = str:find("|", idx, true)
+    if not j then return nil, nil end
+    return str:sub(idx, j - 1), j + 1
+  end
+
   local idx = 1
   local function nextField()
-    local f
-    f, idx = ParseNextField(s, idx)
-    return f
+    local f; f, idx = ParseNextField(s, idx); return f
   end
 
   local magic = nextField()
-  if magic ~= EXPORT_MAGIC then
-    return false, "Not a CDMProfileVault export string."
-  end
-
-  local scope = nextField()
+  if magic ~= EXPORT_MAGIC1 then return false, "Not a CDMProfileVault export string." end
+  nextField() -- scope
   local classCount = tonumber(nextField() or "0") or 0
-  if classCount <= 0 then
-    return false, "Export string has no classes."
-  end
+  if classCount <= 0 then return false, "Export string has no classes." end
 
   local importedProfiles = 0
+  local meta = { lastClass = nil, lastIndex = nil }
+  local usedNamesPerClass = {}
 
   for _ = 1, classCount do
-    local tag = nextField()
-    if tag ~= "C" then
-      return false, "Corrupt export (expected class tag)."
-    end
+    if nextField() ~= "C" then return false, "Corrupt export (expected class tag)." end
 
-    local classNameB64 = nextField() or ""
-    local className = b64dec(classNameB64)
-    if not className or className == "" then
-      return false, "Corrupt export (bad class name)."
-    end
+    local className = b64dec(nextField() or "")
+    className = NormalizeClassName(className)
+    if not className then return false, "Corrupt export (bad class name)." end
 
     local profCount = tonumber(nextField() or "0") or 0
     local profiles = EnsureProfilesForClass(className)
 
-    for __ = 1, profCount do
-      local ptag = nextField()
-      if ptag ~= "P" then
-        return false, "Corrupt export (expected profile tag)."
-      end
+    usedNamesPerClass[className] = usedNamesPerClass[className] or {}
+    local used = usedNamesPerClass[className]
 
-      local name = b64dec(nextField() or "")
-      local text = b64dec(nextField() or "")
+    for __ = 1, profCount do
+      if nextField() ~= "P" then return false, "Corrupt export (expected profile tag)." end
+
+      local name = b64dec(nextField() or "") or ""
+      local text = b64dec(nextField() or "") or ""
       local lastPasted = tonumber(nextField() or "0") or 0
-      local sharedFrom = b64dec(nextField() or "")
+      local sharedFrom = b64dec(nextField() or "") or ""
       local sharedAt = tonumber(nextField() or "0") or 0
 
-      if name == nil then name = "" end
-      if text == nil then text = "" end
-      if sharedFrom == nil or sharedFrom == "" then sharedFrom = nil end
+      name = CleanProfileName(name)
+      text = CleanTextNoNulls(text)
+      sharedFrom = Trim(sharedFrom:gsub("[%z%c]", ""))
+      if sharedFrom == "" then sharedFrom = nil end
       if sharedAt <= 0 then sharedAt = nil end
 
       if forceSharedFrom then sharedFrom = forceSharedFrom end
       if forceSharedAt then sharedAt = forceSharedAt end
       if forceLastPasted then lastPasted = forceLastPasted end
 
+      if name == "" then name = "Imported Profile" end
+
       local existingIdx = FindProfileIndexByName(className, name)
-      if existingIdx then
+
+      if mode == "OVERWRITE" and existingIdx then
         local ep = profiles[existingIdx]
         NormalizeProfile(ep)
-        ep.name = name
-        ep.text = text
+        ep.name, ep.text = name, text
         ep.lastPasted = lastPasted
-        ep.lastSavedName = name
-        ep.lastSavedText = text
-        ep.sharedFrom = sharedFrom
-        ep.sharedAt = sharedAt
+        ep.lastSavedName, ep.lastSavedText = name, text
+        ep.sharedFrom, ep.sharedAt = sharedFrom, sharedAt
+        meta.lastClass, meta.lastIndex = className, existingIdx
       else
-        local np = {
-          name = name,
-          text = text,
-          lastPasted = lastPasted,
-          lastSavedName = name,
-          lastSavedText = text,
-          sharedFrom = sharedFrom,
-          sharedAt = sharedAt,
-        }
-        NormalizeProfile(np)
-        profiles[#profiles + 1] = np
+        if existingIdx then
+          local ep = profiles[existingIdx]
+          NormalizeProfile(ep)
+          if (ep.text or "") == (text or "") then
+            ep.lastPasted = lastPasted
+            ep.sharedFrom, ep.sharedAt = sharedFrom, sharedAt
+            meta.lastClass, meta.lastIndex = className, existingIdx
+          else
+            local unique = MakeUniqueName(className, name, used)
+            local np = {
+              name = unique, text = text,
+              lastPasted = lastPasted,
+              lastSavedName = unique, lastSavedText = text,
+              sharedFrom = sharedFrom, sharedAt = sharedAt,
+            }
+            NormalizeProfile(np)
+            profiles[#profiles + 1] = np
+            meta.lastClass, meta.lastIndex = className, #profiles
+          end
+        else
+          local unique = MakeUniqueName(className, name, used)
+          local np = {
+            name = unique, text = text,
+            lastPasted = lastPasted,
+            lastSavedName = unique, lastSavedText = text,
+            sharedFrom = sharedFrom, sharedAt = sharedAt,
+          }
+          NormalizeProfile(np)
+          profiles[#profiles + 1] = np
+          meta.lastClass, meta.lastIndex = className, #profiles
+        end
       end
 
       importedProfiles = importedProfiles + 1
     end
   end
 
-  return true, "Imported " .. importedProfiles .. " profiles."
+  return true, "Imported " .. importedProfiles .. " profiles.", meta
+end
+
+local function ImportBundle(bundleString, opts)
+  if (bundleString or ""):sub(1, #EXPORT_MAGIC2) == EXPORT_MAGIC2 then
+    return ImportBundleV2(bundleString, opts)
+  end
+  if (bundleString or ""):find("^" .. EXPORT_MAGIC1, 1, false) then
+    return ImportBundleV1(bundleString, opts)
+  end
+  return false, "Not a CDMProfileVault export string."
 end
 
 -- =========================
--- DB init / restore
+-- DB init + migration
 -- =========================
 local function InitDB()
   _G[SV_NAME] = _G[SV_NAME] or {}
@@ -502,6 +746,29 @@ local function InitDB()
     for i = 1, #(DB.classes[className].profiles) do
       NormalizeProfile(DB.classes[className].profiles[i])
     end
+  end
+
+  local toMove = {}
+  for k, _ in pairs(DB.classes) do
+    if type(k) == "string" and not IsKnownClassDisplay(k) then
+      local norm = NormalizeClassName(k)
+      if norm and IsKnownClassDisplay(norm) and norm ~= k then
+        toMove[#toMove + 1] = { from = k, to = norm }
+      end
+    end
+  end
+
+  for _, m in ipairs(toMove) do
+    local src = DB.classes[m.from]
+    local dstProfiles = EnsureProfilesForClass(m.to)
+    if src and src.profiles then
+      for i = 1, #src.profiles do
+        local p = src.profiles[i]
+        NormalizeProfile(p)
+        table.insert(dstProfiles, p)
+      end
+    end
+    DB.classes[m.from] = nil
   end
 end
 
@@ -676,11 +943,9 @@ end
 -- =========================
 local UI = {
   frame = nil,
-
   classDropdown = nil,
   classDropdownType = nil,
   classIconTex = nil,
-
   minimapCheck = nil,
 
   listScroll = nil,
@@ -722,8 +987,7 @@ end
 
 local function SafetyRestoreCurrentProfileIfEmptied()
   local p = GetSelectedProfile()
-  if not p then return end
-  SafetyRestoreProfileIfEmptied(p)
+  if p then SafetyRestoreProfileIfEmptied(p) end
 end
 
 local function UpdateClassDropdownText()
@@ -868,12 +1132,15 @@ local function RefreshList()
 end
 
 local function SelectClass(className)
+  local norm = NormalizeClassName(className)
+  if not norm or not IsKnownClassDisplay(norm) then return end
+
   SafetyRestoreCurrentProfileIfEmptied()
 
-  UI.selectedClass = className
+  UI.selectedClass = norm
   UI.selectedProfileIndex = nil
   UpdateClassDropdownText()
-  SetClassIconTexture(className)
+  SetClassIconTexture(norm)
   UpdateEditor()
   RefreshList()
 end
@@ -891,7 +1158,7 @@ local function JumpToPlayerClass()
 end
 
 -- =========================
--- StaticPopups (overwrite every load)
+-- StaticPopups
 -- =========================
 StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = {
   text = "Delete profile '%s'?",
@@ -904,23 +1171,19 @@ StaticPopupDialogs["CDM_PROFILEVAULT_DELETE_PROFILE"] = {
   OnAccept = function(self, data)
     data = data or self.data
     if not data or not data.className or not data.index then return end
-    local className = data.className
-    local idx = data.index
-
-    local profiles = EnsureProfilesForClass(className)
-    if not profiles[idx] then return end
-    table.remove(profiles, idx)
-
-    if UI.selectedClass ~= className then return end
-    UI.selectedProfileIndex = (#profiles > 0) and math.min(idx, #profiles) or nil
-
-    UpdateEditor()
-    RefreshList()
+    local profiles = EnsureProfilesForClass(data.className)
+    if not profiles[data.index] then return end
+    table.remove(profiles, data.index)
+    if UI.selectedClass == data.className then
+      UI.selectedProfileIndex = (#profiles > 0) and math.min(data.index, #profiles) or nil
+      UpdateEditor()
+      RefreshList()
+    end
   end,
 }
 
 StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = {
-  text = "Share.\n\nEnter player name (Name-Realm) to whisper.\nLeave blank to send to Party/Raid.\n\nTip: Shift+Share = class bundle. Ctrl+Shift+Share = all classes.",
+  text = "Share.\n\nEnter player name (Name-Realm) to whisper.\nLeave blank to send to Party/Raid.\n\nTo share more than one:\n- Hold SHIFT while clicking Send = share ALL profiles in this class\n- Hold CTRL+SHIFT while clicking Send = share ALL classes",
   button1 = "Send",
   button2 = "Cancel",
   hasEditBox = true,
@@ -948,17 +1211,15 @@ StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = {
     local target = Trim(eb and eb:GetText() or "")
 
     local channel, whisperTarget = nil, nil
-
     if target ~= "" then
       channel = "WHISPER"
       whisperTarget = target
       if not target:find("-", 1, true) then
-        print("CDMProfileVault: Note: If the player is on another realm, use Name-Realm.")
+        print("CDMProfileVault: If the player is on another realm, use Name-Realm.")
       end
     else
       local inInstRaid = IsInRaid and IsInRaid(LE_PARTY_CATEGORY_INSTANCE)
       local inInstParty = IsInGroup and IsInGroup(LE_PARTY_CATEGORY_INSTANCE)
-
       if inInstRaid or inInstParty then
         channel = "INSTANCE_CHAT"
       elseif IsInRaid() then
@@ -971,16 +1232,50 @@ StaticPopupDialogs["CDM_PROFILEVAULT_SHARE_TO"] = {
       end
     end
 
-    local pl = data.payload
-    StartShare(pl.kind, pl.className, pl.profileName, pl.text, channel, whisperTarget)
+    local base = data.payload
+    local baseClass = NormalizeClassName(base.baseClass or UI.selectedClass) or UI.selectedClass
+
+    local finalKind, finalClassName, finalProfileName, finalText
+
+    if IsShiftKeyDown() then
+      if IsControlKeyDown() then
+        finalKind = "BUNDLE_ALL"
+        finalClassName = "All Classes"
+        finalProfileName = "Vault Export"
+        finalText = ExportBundle("ALL", baseClass)
+      else
+        finalKind = "BUNDLE_CLASS"
+        finalClassName = baseClass
+        finalProfileName = baseClass .. " Export"
+        finalText = ExportBundle("CLASS", baseClass)
+      end
+    else
+      finalKind = "PROFILE"
+      finalClassName = baseClass
+
+      local p = GetSelectedProfile()
+      if not p then
+        print("CDMProfileVault: Select a profile to share.")
+        return
+      end
+      SafetyRestoreProfileIfEmptied(p)
+      finalProfileName = (p.name and p.name ~= "" and p.name) or "Shared Profile"
+      finalText = p.text or ""
+      if finalText == "" then
+        print("CDMProfileVault: Nothing to share (empty).")
+        return
+      end
+    end
+
+    StartShare(finalKind, finalClassName, finalProfileName, finalText, channel, whisperTarget)
   end,
 
   EditBoxOnEnterPressed = function(editBox)
     local dialog = editBox.owningDialog or editBox:GetParent()
-    if type(StaticPopup_OnClick) == "function" then
-      StaticPopup_OnClick(dialog, 1)
-      return
-    end
+    if not dialog or not dialog.which then return end
+    local info = StaticPopupDialogs and StaticPopupDialogs[dialog.which]
+    if info and info.OnAccept then info.OnAccept(dialog, dialog.data) end
+    if dialog and dialog.Hide then dialog:Hide() end
   end,
 }
 
@@ -996,10 +1291,8 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = {
   OnShow = function(self)
     if not PendingAccept then return end
     local who = Ambiguate(PendingAccept.from or "?", "short")
-
     local textRegion = self.text or self.Text
     if not textRegion then return end
-
     textRegion:SetText(
       "Accept from:\n\n" .. who ..
       "\n\nType: " .. KindLabel(PendingAccept.kind) ..
@@ -1018,29 +1311,35 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = {
     local from = PendingAccept.from
     local now = time()
 
+    local jumpClass, jumpIndex
+
     if kind == "PROFILE" then
-      if not className or not DB.classes or not DB.classes[className] then
-        print("CDMProfileVault: Could not import (unknown class).")
-        PendingAccept = nil
-        return
+      local normClass = NormalizeClassName(className) or NormalizeClassName(UI.selectedClass) or CLASSES[1]
+      if not IsKnownClassDisplay(normClass) then
+        normClass = CLASSES[1]
       end
 
-      local profiles = EnsureProfilesForClass(className)
+      local profiles = EnsureProfilesForClass(normClass)
       local p = {
-        name = profName or "Shared Profile",
-        text = text or "",
+        name = CleanProfileName(profName or "Shared Profile"),
+        text = CleanTextNoNulls(text or ""),
         lastPasted = now,
-        lastSavedName = profName or "Shared Profile",
-        lastSavedText = text or "",
+        lastSavedName = CleanProfileName(profName or "Shared Profile"),
+        lastSavedText = CleanTextNoNulls(text or ""),
         sharedFrom = from,
         sharedAt = now,
       }
       NormalizeProfile(p)
       table.insert(profiles, p)
 
+      jumpClass = normClass
+      jumpIndex = #profiles
+
       print("CDMProfileVault: Imported shared profile from " .. Ambiguate(from or "?", "short") .. ".")
+
     else
-      local ok, msg = ImportBundle(text or "", {
+      local ok, msg, meta = ImportBundle(text or "", {
+        mode = "SMART",
         sharedFrom = from,
         sharedAt = now,
         setLastPasted = now,
@@ -1051,17 +1350,26 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = {
       else
         print("CDMProfileVault: Bundle import failed: " .. (msg or "Unknown error"))
       end
+
+      jumpClass = GetFirstClassFromBundle(text) or (meta and meta.lastClass)
+      jumpIndex = meta and meta.lastIndex
     end
 
-    -- Do NOT clear CompletedShares[id] (so the link doesn't "expire")
-    -- if PendingAccept.id then CompletedShares[PendingAccept.id] = nil end
+    DB.__dirty = time()
 
-    if UI.frame and UI.frame:IsShown() then
-      if kind == "BUNDLE_CLASS" and className and DB.classes and DB.classes[className] then
-        SelectClass(className)
-        local profiles = EnsureProfilesForClass(className)
+    if UI.frame then UI.frame:Show() end
+
+    if jumpClass and IsKnownClassDisplay(jumpClass) then
+      SelectClass(jumpClass)
+      local profiles = EnsureProfilesForClass(jumpClass)
+      if jumpIndex and profiles[jumpIndex] then
+        UI.selectedProfileIndex = jumpIndex
+      else
         UI.selectedProfileIndex = (#profiles > 0) and #profiles or nil
       end
+    end
+
+    if UI.frame and UI.frame:IsShown() then
       UpdateEditor()
       RefreshList()
     end
@@ -1069,9 +1377,7 @@ StaticPopupDialogs["CDM_PROFILEVAULT_ACCEPT_SHARE"] = {
     PendingAccept = nil
   end,
 
-  OnCancel = function()
-    PendingAccept = nil
-  end,
+  OnCancel = function() PendingAccept = nil end,
 }
 
 -- =========================
@@ -1089,8 +1395,9 @@ local function SetupClassDropdown(parent, labelFrame)
     dd:SetupMenu(function(_, root)
       root:CreateTitle("Select class")
       for _, className in ipairs(CLASSES) do
-        local text = ClassIconMarkup(className, 16) .. " " .. className
-        root:CreateButton(text, function() SelectClass(className) end)
+        root:CreateButton(ClassIconMarkup(className, 16) .. " " .. className, function()
+          SelectClass(className)
+        end)
       end
     end)
     return
@@ -1119,7 +1426,7 @@ local function SetupClassDropdown(parent, labelFrame)
 end
 
 -- =========================
--- Copy/Export popup
+-- Copy popup
 -- =========================
 local function ShowCopyFrame(text, titleText)
   if not UI.copyFrame then
@@ -1217,14 +1524,14 @@ local function ShowImportFrame()
     cancelBtn:SetSize(100, 26)
     cancelBtn:SetPoint("RIGHT", importBtn, "LEFT", -8, 0)
     cancelBtn:SetText("Cancel")
-
     cancelBtn:SetScript("OnClick", function() f:Hide() end)
 
     importBtn:SetScript("OnClick", function()
       local text = eb:GetText() or ""
-      local ok, msg = ImportBundle(text)
+      local ok, msg = ImportBundle(text, { mode = "SMART" })
       if ok then
         print("CDMProfileVault: " .. msg)
+        DB.__dirty = time()
         eb:SetText("")
         f:Hide()
         if UI.frame and UI.frame:IsShown() then
@@ -1299,6 +1606,7 @@ local function CreateUI()
   mm:SetScript("OnClick", function(self)
     DB.settings.minimap.show = self:GetChecked() and true or false
     UpdateMinimapButtonVisibility()
+    DB.__dirty = time()
   end)
 
   local classLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -1311,6 +1619,15 @@ local function CreateUI()
   UI.classIconTex:SetPoint("LEFT", UI.classDropdown, "RIGHT", 8, 0)
   SetClassIconTexture(UI.selectedClass)
 
+  -- ========= NEW: In-window share help text (no layout changes) =========
+  local shareHelp = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  shareHelp:SetPoint("TOPLEFT", 12, -78)
+  shareHelp:SetPoint("TOPRIGHT", -12, -78)
+  shareHelp:SetJustifyH("LEFT")
+  shareHelp:SetWordWrap(false)
+  shareHelp:SetText("Share: Share = selected profile  |  Shift+Send = this class  |  Ctrl+Shift+Send = all classes")
+  -- ====================================================================
+
   local topY = -92
   local bottomPad = 12
   local leftW = 280
@@ -1319,6 +1636,10 @@ local function CreateUI()
   local listPanel = CreateFrame("Frame", nil, f)
   listPanel:SetPoint("TOPLEFT", 12, topY)
   listPanel:SetPoint("BOTTOMLEFT", 12, bottomPad)
+  -- (rest of UI creation continues unchanged from your working version)
+  -- NOTE: Keeping the rest identical to avoid layout changes.
+
+  -- Everything below is the same as the previous working file:
   listPanel:SetWidth(leftW)
   ApplyFlatBackground(listPanel, 0.15, 0.15, 0.15, 1.0)
   ApplySharpBorder(listPanel, 2)
@@ -1350,6 +1671,7 @@ local function CreateUI()
     NormalizeProfile(p)
     table.insert(profiles, p)
     UI.selectedProfileIndex = #profiles
+    DB.__dirty = time()
     UpdateEditor()
     RefreshList()
   end)
@@ -1401,6 +1723,7 @@ local function CreateUI()
   nameEdit:SetScript("OnTextChanged", function(_, userInput)
     if userInput then
       AutoSaveName()
+      DB.__dirty = time()
       RefreshList()
     end
   end)
@@ -1459,13 +1782,17 @@ local function CreateUI()
   end)
 
   textEdit:SetScript("OnTextChanged", function(_, userInput)
-    if userInput then AutoSaveText() end
+    if userInput then
+      AutoSaveText()
+      DB.__dirty = time()
+    end
     if userInput and UI.expectingPaste and UI.selectedProfileIndex then
       UI.expectingPaste = false
       local p = GetSelectedProfile()
       if p then
         p.lastPasted = time()
         UI.lastPastedLabel:SetText("Last pasted: " .. FormatTimestamp(p.lastPasted))
+        DB.__dirty = time()
       end
     end
   end)
@@ -1506,9 +1833,9 @@ local function CreateUI()
 
     p.name = UI.nameEdit:GetText() or ""
     p.text = UI.textEdit:GetText() or ""
-
     p.lastSavedName = p.name
     p.lastSavedText = p.text
+    DB.__dirty = time()
 
     RefreshList()
     print("CDMProfileVault: saved.")
@@ -1524,7 +1851,6 @@ local function CreateUI()
       ShowImportFrame()
       return
     end
-
     if not UI.selectedProfileIndex then return end
     UI.expectingPaste = true
     UI.textEdit:SetFocus()
@@ -1566,41 +1892,9 @@ local function CreateUI()
       elseif n then defaultTarget = n end
     end
 
-    local kind = "PROFILE"
-    local className = UI.selectedClass
-    local profileName = nil
-    local payloadText = nil
-
-    if IsShiftKeyDown() then
-      if IsControlKeyDown() then
-        kind = "BUNDLE_ALL"
-        className = "All Classes"
-        profileName = "Vault Export"
-        payloadText = ExportBundle("ALL", UI.selectedClass)
-      else
-        kind = "BUNDLE_CLASS"
-        className = UI.selectedClass
-        profileName = UI.selectedClass .. " Export"
-        payloadText = ExportBundle("CLASS", UI.selectedClass)
-      end
-    else
-      local p = GetSelectedProfile()
-      if not p then
-        print("CDMProfileVault: Select a profile to share (or Shift+Share for a bundle).")
-        return
-      end
-      SafetyRestoreProfileIfEmptied(p)
-      profileName = (p.name and p.name ~= "" and p.name) or ("Profile " .. UI.selectedProfileIndex)
-      payloadText = p.text or ""
-      if payloadText == "" then
-        print("CDMProfileVault: Nothing to share (empty string).")
-        return
-      end
-    end
-
     StaticPopup_Show("CDM_PROFILEVAULT_SHARE_TO", nil, nil, {
       defaultTarget = defaultTarget,
-      payload = { kind = kind, className = className, profileName = profileName, text = payloadText },
+      payload = { baseClass = UI.selectedClass },
     })
   end)
 
@@ -1614,6 +1908,7 @@ local function CreateUI()
     local p = GetSelectedProfile()
     local name = (p and p.name and p.name ~= "" and p.name) or ("Profile " .. UI.selectedProfileIndex)
     StaticPopup_Show("CDM_PROFILEVAULT_DELETE_PROFILE", name, nil, { className = UI.selectedClass, index = UI.selectedProfileIndex })
+    DB.__dirty = time()
   end)
 
   UpdateEditor()
@@ -1652,9 +1947,7 @@ local function HandleShareLinkClick(id)
     return
   end
 
-  if not (UI.frame and UI.frame:IsShown()) then
-    ToggleMainFrame()
-  end
+  if UI.frame then UI.frame:Show() end
 
   PendingAccept = {
     id = id,
@@ -1687,37 +1980,21 @@ local function OnAddonMessage(prefix, msg, channel, sender)
   if prefix ~= COMM_PREFIX then return end
   if not msg or msg == "" then return end
   if not sender or sender == "" then return end
-
-  local myFull = GetMyFullName()
-  if sender == myFull then return end
+  if sender == GetMyFullName() then return end
 
   local typ = msg:sub(1, 1)
 
   if typ == "M" then
-    -- v2: M id kind class name total
-    local a, id, kind, className, profileName, total = strsplit(SEP, msg, 6)
-
-    -- Backward fallback (older format): M id class name total
-    if not total then
-      local _, id2, class2, name2, total2 = strsplit(SEP, msg, 5)
-      id = id2
-      kind = "PROFILE"
-      className = class2
-      profileName = name2
-      total = total2
-    end
-
+    local _, id, kind, className, profileName, total = strsplit(SEP, msg, 6)
     total = tonumber(total or "0") or 0
     if not id or id == "" or total <= 0 then return end
-    if kind ~= "PROFILE" and kind ~= "BUNDLE_CLASS" and kind ~= "BUNDLE_ALL" then
-      kind = "PROFILE"
-    end
+    if kind ~= "PROFILE" and kind ~= "BUNDLE_CLASS" and kind ~= "BUNDLE_ALL" then kind = "PROFILE" end
 
     PendingIncoming[id] = {
       from = sender,
       kind = kind,
-      className = className or "Unknown",
-      profileName = profileName or "Shared",
+      className = CleanMetaField(className or "Unknown"),
+      profileName = CleanMetaField(profileName or "Shared"),
       total = total,
       parts = {},
       got = {},
@@ -1729,8 +2006,9 @@ local function OnAddonMessage(prefix, msg, channel, sender)
 
   if typ == "D" then
     local _, id, idx, payload = strsplit(SEP, msg, 4)
-    if not id or not PendingIncoming[id] then return end
-    local p = PendingIncoming[id]
+    local p = id and PendingIncoming[id]
+    if not p then return end
+
     idx = tonumber(idx or "0") or 0
     if idx <= 0 or idx > p.total then return end
 
@@ -1744,8 +2022,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
       local full = table.concat(p.parts, "")
       PendingIncoming[id] = nil
 
-      local ch = p.recvChannel
-      if ch == "PARTY" or ch == "RAID" or ch == "WHISPER" or ch == "INSTANCE_CHAT" then
+      if channel == "PARTY" or channel == "RAID" or channel == "WHISPER" or channel == "INSTANCE_CHAT" then
         CompletedShares[id] = {
           from = p.from,
           kind = p.kind,
@@ -1758,11 +2035,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
         local who = Ambiguate(p.from, "short")
         ChatPrint(string.format(
           "|cff00ff00[CDMProfileVault]|r %s shared %s: %s / %s %s",
-          who,
-          KindLabel(p.kind),
-          p.className or "?",
-          p.profileName or "?",
-          ShareLink(id)
+          who, KindLabel(p.kind), p.className or "?", p.profileName or "?", ShareLink(id)
         ))
       end
     end
@@ -1816,8 +2089,7 @@ loader:SetScript("OnEvent", function(_, event, a1, a2, a3, a4)
   end
 
   if event == "CHAT_MSG_ADDON" then
-    local prefix, msg, channel, sender = a1, a2, a3, a4
-    OnAddonMessage(prefix, msg, channel, sender)
+    OnAddonMessage(a1, a2, a3, a4)
     return
   end
 end)
