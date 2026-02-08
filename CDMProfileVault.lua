@@ -873,6 +873,23 @@ local function UpdateMinimapButtonVisibility()
   if DB.settings.minimap.show then MinimapButton:Show() else MinimapButton:Hide() end
 end
 
+local function ShowTooltip(owner, title, lines)
+  if not GameTooltip then return end
+  GameTooltip:SetOwner(owner, "ANCHOR_TOP")
+  GameTooltip:ClearLines()
+  GameTooltip:AddLine(title, 1, 1, 1)
+  if lines then
+    for i = 1, #lines do
+      GameTooltip:AddLine(lines[i], 0.85, 0.85, 0.85, true)
+    end
+  end
+  GameTooltip:Show()
+end
+
+local function HideTooltip()
+  if GameTooltip then GameTooltip:Hide() end
+end
+
 local function CreateMinimapButton(toggleMainFrameFunc)
   MinimapButton = CreateFrame("Button", "CDMProfileVaultMinimapButton", Minimap)
   MinimapButton:SetSize(32, 32)
@@ -898,6 +915,16 @@ local function CreateMinimapButton(toggleMainFrameFunc)
       print("CDMProfileVault minimap button: " .. (DB.settings.minimap.show and "shown" or "hidden"))
     end
   end)
+
+  MinimapButton:SetScript("OnEnter", function(self)
+    ShowTooltip(self, "CDMProfileVault", {
+      "Store and organize Cooldown Manager profile strings by class.",
+      "Copy/Paste, save, and share profiles in party/raid/whisper.",
+      "Left-click: Open/Close.",
+      "Right-click: Toggle minimap icon.",
+    })
+  end)
+  MinimapButton:SetScript("OnLeave", HideTooltip)
 
   MinimapButton:SetScript("OnDragStart", function(self)
     self:SetScript("OnUpdate", function()
@@ -1590,6 +1617,20 @@ local function CreateUI()
   title:SetPoint("TOP", 0, -10)
   title:SetText("CDMProfileVault")
 
+  -- Tooltip hit-area over title (FontStrings can't receive mouse reliably)
+  local titleHit = CreateFrame("Frame", nil, f)
+  titleHit:SetPoint("TOP", f, "TOP", 0, -6)
+  titleHit:SetSize(260, 28)
+  titleHit:EnableMouse(true)
+  titleHit:SetScript("OnEnter", function(self)
+    ShowTooltip(self, "CDMProfileVault", {
+      "A vault for Cooldown Manager profile strings.",
+      "Organize by class, store multiple profiles, copy/paste quickly.",
+      "Share profiles/bundles in party/raid/whisper with one-click import.",
+    })
+  end)
+  titleHit:SetScript("OnLeave", HideTooltip)
+
   local headerLine = f:CreateTexture(nil, "BORDER")
   headerLine:SetColorTexture(0, 0, 0, 1)
   headerLine:SetPoint("TOPLEFT", 2, -40)
@@ -1619,14 +1660,13 @@ local function CreateUI()
   UI.classIconTex:SetPoint("LEFT", UI.classDropdown, "RIGHT", 8, 0)
   SetClassIconTexture(UI.selectedClass)
 
-  -- ========= NEW: In-window share help text (no layout changes) =========
+  -- In-window share help text
   local shareHelp = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   shareHelp:SetPoint("TOPLEFT", 12, -78)
   shareHelp:SetPoint("TOPRIGHT", -12, -78)
   shareHelp:SetJustifyH("LEFT")
   shareHelp:SetWordWrap(false)
   shareHelp:SetText("Share: Share = selected profile  |  Shift+Send = this class  |  Ctrl+Shift+Send = all classes")
-  -- ====================================================================
 
   local topY = -92
   local bottomPad = 12
@@ -1636,10 +1676,6 @@ local function CreateUI()
   local listPanel = CreateFrame("Frame", nil, f)
   listPanel:SetPoint("TOPLEFT", 12, topY)
   listPanel:SetPoint("BOTTOMLEFT", 12, bottomPad)
-  -- (rest of UI creation continues unchanged from your working version)
-  -- NOTE: Keeping the rest identical to avoid layout changes.
-
-  -- Everything below is the same as the previous working file:
   listPanel:SetWidth(leftW)
   ApplyFlatBackground(listPanel, 0.15, 0.15, 0.15, 1.0)
   ApplySharpBorder(listPanel, 2)
