@@ -430,8 +430,14 @@ local function ReadBytesLine(s, i, n)
   if j > #s then return nil, nil end
   local bytes = s:sub(i, j)
   local nl = s:sub(j + 1, j + 1)
-  if nl ~= "\n" then return nil, nil end
-  return bytes, j + 2
+  if nl == "\n" then
+    return bytes, j + 2
+  end
+  -- Allow EOF (some paste targets trim the very last newline)
+  if j == #s then
+    return bytes, j + 1
+  end
+  return nil, nil
 end
 
 local function GetFirstClassFromBundle(bundleString)
@@ -731,6 +737,115 @@ local function ImportBundle(bundleString, opts)
   end
   return false, "Not a CDMProfileVault export string."
 end
+
+-- =========================
+-- FULL Backup Export / Import (CDMPVBACKUP1)
+-- =========================
+local BACKUP_MAGIC = "CDMPVBACKUP1"
+
+local function ExportFullBackup()
+  local show = (DB and DB.settings and DB.settings.minimap and DB.settings.minimap.show) and 1 or 0
+  local angle = 225
+  if DB and DB.settings and DB.settings.minimap and DB.settings.minimap.angle then
+    angle = tonumber(DB.settings.minimap.angle) or 225
+  end
+
+  local bundle = ExportBundle("ALL")
+
+  local out = {}
+  out[#out + 1] = BACKUP_MAGIC .. "\n"
+  out[#out + 1] = "SETTINGS\n"
+  out[#out + 1] = tostring(show) .. "\n"
+  out[#out + 1] = tostring(angle) .. "\n"
+  out[#out + 1] = "BUNDLE\n"
+  out[#out + 1] = tostring(#bundle) .. "\n"
+  out[#out + 1] = bundle .. "\n" -- terminator newline after length-prefixed bytes
+  return table.concat(out, "")
+end
+
+local function ImportFullBackup(backupString)
+  local s = backupString or ""
+
+  -- Normalize line endings (some paste targets insert Windows CRLF)
+  s = s:gsub("\r\n", "\n"):gsub("\r", "\n")
+  -- Only strip leading whitespace (do NOT trim the end; users may lose trailing newlines)
+  s = s:gsub("^%s+", "")
+
+  if s == "" then return false, "Empty import string." end
+  if s:sub(1, #BACKUP_MAGIC) ~= BACKUP_MAGIC then
+    return false, "Not a CDMPVBACKUP1 string."
+  end
+
+  -- Ensure we have a final newline so ReadLine() can parse the last line reliably
+  if s:sub(-1) ~= "\n" then
+    s = s .. "\n"
+  end
+
+  local i = 1
+  local magic; magic, i = ReadLine(s, i)
+  if magic ~= BACKUP_MAGIC then return false, "Bad backup magic." end
+
+  local tag; tag, i = ReadLine(s, i)
+  if tag ~= "SETTINGS" then return false, "Corrupt backup (expected SETTINGS)." end
+
+  local showN; showN, i = ReadNumberLine(s, i)
+  if showN == nil then return false, "Corrupt backup (bad minimap show)." end
+
+  local angle; angle, i = ReadNumberLine(s, i)
+  if angle == nil then return false, "Corrupt backup (bad minimap angle)." end
+
+  -- Optional header (older/newer backups may vary). If present, skip it.
+  local tag2; tag2, i = ReadLine(s, i)
+  if tag2 == "BUNDLE" then
+    -- Next line may be a legacy byte-length. We no longer rely on it (copy/paste targets may truncate).
+    local _blen; _blen, i = ReadNumberLine(s, i)
+    -- If the length line is missing, we still try to recover by searching for bundle magic below.
+    if not i then i = 1 end
+  else
+    -- Not the expected tag; search from start.
+    i = 1
+  end
+
+  -- Robust recovery: locate the embedded export bundle by magic rather than trusting byte-length.
+  local pos = s:find(EXPORT_MAGIC2, i, true) or s:find(EXPORT_MAGIC1, i, true)
+  if not pos then
+    return false, "Corrupt backup (missing bundle). Make sure you copied the entire string (it must include CDMPVEXP2...)."
+  end
+
+  local bundle = s:sub(pos)
+  bundle = bundle:gsub("\r\n", "\n"):gsub("\r", "\n")
+  if bundle:sub(-1) ~= "\n" then
+    bundle = bundle .. "\n"
+  end
+
+  -- Replace DB entirely (new-PC restore behavior)
+  local newDB = DeepCopyDefaults(DEFAULTS, {})
+  newDB.settings.minimap.show = (showN ~= 0)
+  newDB.settings.minimap.angle = tonumber(angle) or 225
+  newDB.classes = {}
+
+  _G[SV_NAME] = newDB
+  DB = newDB
+
+  local ok, msg, meta = ImportBundle(bundle, { mode = "SMART" })
+  if not ok then
+    return false, msg or "Import failed."
+  end
+
+  DB.__dirty = time()
+  return true, "Restored full backup.", meta
+end
+
+local function ImportAnyString(str, opts)
+  local raw = str or ""
+  local t = Trim(raw)
+  if t == "" then return false, "Empty import string." end
+  if t:sub(1, #BACKUP_MAGIC) == BACKUP_MAGIC then
+    return ImportFullBackup(raw)
+  end
+  return ImportBundle(t, opts)
+end
+
 
 -- =========================
 -- DB init + migration
@@ -1481,6 +1596,10 @@ local function ShowCopyFrame(text, titleText)
 
     local eb = CreateFrame("EditBox", nil, sf)
     eb:SetMultiLine(true)
+    if eb.SetMaxLetters then eb:SetMaxLetters(0) end
+    if eb.SetMaxBytes then eb:SetMaxBytes(0) end
+  if eb.SetMaxLetters then eb:SetMaxLetters(0) end
+  if eb.SetMaxBytes then eb:SetMaxBytes(0) end
     eb:SetFontObject("ChatFontNormal")
     eb:SetWidth(500)
     eb:SetAutoFocus(false)
@@ -1533,6 +1652,10 @@ local function ShowImportFrame()
 
     local eb = CreateFrame("EditBox", nil, sf)
     eb:SetMultiLine(true)
+    if eb.SetMaxLetters then eb:SetMaxLetters(0) end
+    if eb.SetMaxBytes then eb:SetMaxBytes(0) end
+  if eb.SetMaxLetters then eb:SetMaxLetters(0) end
+  if eb.SetMaxBytes then eb:SetMaxBytes(0) end
     eb:SetFontObject("ChatFontNormal")
     eb:SetWidth(500)
     eb:SetAutoFocus(true)
@@ -1576,6 +1699,191 @@ local function ShowImportFrame()
   UI.importFrame:Show()
   UI.importFrame.editBox:SetFocus()
   UI.importFrame.editBox:HighlightText()
+end
+
+
+-- =========================
+-- AddOns Options (Import / Export FULL backup)
+-- =========================
+local OptionsPanel = nil
+local OptionsCategory = nil
+
+local function OpenOptionsPanel()
+  if Settings and Settings.OpenToCategory and OptionsCategory and OptionsCategory.ID then
+    pcall(Settings.OpenToCategory, OptionsCategory.ID)
+    return
+  end
+  if InterfaceOptionsFrame_OpenToCategory and OptionsPanel then
+    InterfaceOptionsFrame_OpenToCategory(OptionsPanel)
+    InterfaceOptionsFrame_OpenToCategory(OptionsPanel) -- (Blizz quirk)
+    return
+  end
+end
+
+local function CreateOptionsPanel()
+  if OptionsPanel then return end
+
+  local p = CreateFrame("Frame", "CDMProfileVaultOptionsPanel", UIParent)
+  OptionsPanel = p
+
+  local title = p:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+  title:SetPoint("TOPLEFT", 16, -16)
+  title:SetText("CDMProfileVault - Import / Export")
+
+  local sub = p:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+  sub:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -6)
+  sub:SetPoint("RIGHT", p, "RIGHT", -16, 0)
+  sub:SetJustifyH("LEFT")
+  sub:SetText("Export creates a FULL backup string (settings + all classes/profiles). Paste a string and click Import.")
+
+  local box = CreateFrame("Frame", nil, p)
+  box:SetPoint("TOPLEFT", sub, "BOTTOMLEFT", 0, -12)
+  box:SetPoint("BOTTOMRIGHT", p, "BOTTOMRIGHT", -16, 56)
+  ApplyFlatBackground(box, 0.12, 0.12, 0.12, 1.0)
+  ApplySharpBorder(box, 2)
+
+  local sf = CreateFrame("ScrollFrame", nil, box, "UIPanelScrollFrameTemplate")
+  sf:SetPoint("TOPLEFT", 8, -8)
+  sf:SetPoint("BOTTOMRIGHT", -28, 8)
+	  sf:EnableMouse(true)
+
+	  local eb = CreateFrame("EditBox", nil, sf)
+	  eb:ClearAllPoints()
+	  eb:SetPoint("TOPLEFT", 0, 0)
+  eb:SetMultiLine(true)
+  if eb.SetMaxLetters then eb:SetMaxLetters(0) end
+  if eb.SetMaxBytes then eb:SetMaxBytes(0) end
+  eb:SetAutoFocus(false)
+  eb:EnableMouse(true)
+  eb:SetFontObject("ChatFontNormal")
+  eb:SetTextInsets(8, 8, 8, 8)
+  eb:SetText("")
+  eb:SetWidth(500)
+  eb:SetHeight(200)
+  eb:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+	  eb:SetScript("OnMouseDown", function(self) self:SetFocus() end)
+	  sf:SetScript("OnMouseDown", function() eb:SetFocus() end)
+
+  sf:SetScrollChild(eb)
+
+  local function UpdateEditboxSize()
+    local w = sf:GetWidth() or 0
+    eb:SetWidth(math.max(1, w - 24))
+    local h = (eb.GetTextHeight and eb:GetTextHeight()) or 0
+    h = (tonumber(h) or 0) + 20
+    local minH = (sf:GetHeight() or 0)
+    if h < minH then h = minH end
+    eb:SetHeight(h)
+    sf:UpdateScrollChildRect()
+  end
+
+  eb:SetScript("OnTextChanged", UpdateEditboxSize)
+  eb:SetScript("OnCursorChanged", UpdateEditboxSize)
+	  sf:SetScript("OnSizeChanged", UpdateEditboxSize)
+
+	  -- Ensure the editbox has a real clickable size the moment the panel opens.
+	  if C_Timer and C_Timer.After then
+	    C_Timer.After(0, UpdateEditboxSize)
+	  else
+	    UpdateEditboxSize()
+	  end
+
+  p._cdmvExport = function()
+    local s = ExportFullBackup()
+    eb:SetText(s or "")
+    eb:SetFocus()
+    eb:HighlightText()
+    sf:SetVerticalScroll(0)
+    UpdateEditboxSize()
+  end
+
+  p._cdmvSelectAll = function()
+    eb:SetFocus()
+    eb:HighlightText()
+  end
+
+  p._cdmvClear = function()
+    eb:SetText("")
+    eb:SetFocus()
+    sf:SetVerticalScroll(0)
+    UpdateEditboxSize()
+  end
+
+	  p._cdmvImport = function()
+	    local raw = eb:GetText() or ""
+	    if Trim(raw) == "" then
+      print("CDMProfileVault: Nothing to import.")
+      return
+    end
+
+	    -- Pass RAW text (do not trim) so FULL backups remain length-accurate.
+	    local ok, msg, meta = ImportAnyString(raw, { mode = "SMART" })
+    if ok then
+      if meta and meta.lastClass and IsKnownClassDisplay(meta.lastClass) then
+        UI.selectedClass = meta.lastClass
+        UI.selectedProfileIndex = meta.lastIndex
+        UpdateClassDropdownText()
+        SetClassIconTexture(UI.selectedClass)
+      end
+
+      if UI.minimapCheck then
+        UI.minimapCheck:SetChecked(DB.settings.minimap.show and true or false)
+      end
+      UpdateMinimapButtonPosition()
+      UpdateMinimapButtonVisibility()
+
+      if UI.frame and UI.frame:IsShown() then
+        UpdateEditor()
+        RefreshList()
+      end
+
+      DB.__dirty = time()
+      print("CDMProfileVault: " .. (msg or "Import succeeded."))
+    else
+      print("CDMProfileVault: Import failed - " .. (msg or "Unknown error"))
+    end
+  end
+
+  local exportBtn = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+  exportBtn:SetSize(140, 24)
+  exportBtn:SetPoint("BOTTOMLEFT", 16, 16)
+  exportBtn:SetText("Export FULL")
+  exportBtn:SetScript("OnClick", p._cdmvExport)
+
+  local clearBtn = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+  clearBtn:SetSize(100, 24)
+  clearBtn:SetPoint("LEFT", exportBtn, "RIGHT", 8, 0)
+  clearBtn:SetText("Clear")
+  clearBtn:SetScript("OnClick", p._cdmvClear)
+
+  local importBtn = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+  importBtn:SetSize(100, 24)
+  importBtn:SetPoint("LEFT", clearBtn, "RIGHT", 8, 0)
+  importBtn:SetText("Import")
+  importBtn:SetScript("OnClick", p._cdmvImport)
+
+  local selectBtn = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+  selectBtn:SetSize(100, 24)
+  selectBtn:SetPoint("LEFT", importBtn, "RIGHT", 8, 0)
+  selectBtn:SetText("Select All")
+  selectBtn:SetScript("OnClick", p._cdmvSelectAll)
+
+  p:SetScript("OnShow", function()
+    UpdateEditboxSize()
+    if C_Timer and C_Timer.After then
+      C_Timer.After(0, UpdateEditboxSize)
+    end
+  end)
+
+  -- Register into settings / interface options
+  if Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory then
+    local cat = Settings.RegisterCanvasLayoutCategory(p, "CDMProfileVault")
+    OptionsCategory = cat
+    Settings.RegisterAddOnCategory(cat)
+  elseif InterfaceOptions_AddCategory then
+    p.name = "CDMProfileVault"
+    InterfaceOptions_AddCategory(p)
+  end
 end
 
 -- =========================
@@ -1622,6 +1930,9 @@ local function CreateUI()
   titleHit:SetPoint("TOP", f, "TOP", 0, -6)
   titleHit:SetSize(260, 28)
   titleHit:EnableMouse(true)
+  titleHit:RegisterForDrag("LeftButton")
+  titleHit:SetScript("OnDragStart", function() f:StartMoving() end)
+  titleHit:SetScript("OnDragStop", function() f:StopMovingOrSizing() end)
   titleHit:SetScript("OnEnter", function(self)
     ShowTooltip(self, "CDMProfileVault", {
       "A vault for Cooldown Manager profile strings.",
@@ -1637,18 +1948,28 @@ local function CreateUI()
   headerLine:SetPoint("TOPRIGHT", -2, -40)
   headerLine:SetHeight(2)
 
-  local mm = CreateFrame("CheckButton", nil, f, "ChatConfigCheckButtonTemplate")
-  mm:SetPoint("TOPRIGHT", close, "TOPLEFT", -14, -2)
-  mm:SetChecked(DB.settings.minimap.show and true or false)
-  mm.Text:SetText("Minimap")
-  mm.Text:ClearAllPoints()
-  mm.Text:SetPoint("RIGHT", mm, "LEFT", -6, 0)
-  UI.minimapCheck = mm
-  mm:SetScript("OnClick", function(self)
-    DB.settings.minimap.show = self:GetChecked() and true or false
-    UpdateMinimapButtonVisibility()
-    DB.__dirty = time()
-  end)
+  
+local mm = CreateFrame("CheckButton", nil, f, "ChatConfigCheckButtonTemplate")
+mm:SetPoint("TOPRIGHT", close, "TOPLEFT", -90, -4)
+mm:SetChecked(DB.settings.minimap.show and true or false)
+mm.Text:SetText("Minimap")
+mm.Text:ClearAllPoints()
+mm.Text:SetPoint("LEFT", mm, "RIGHT", 2, 0)
+UI.minimapCheck = mm
+mm:SetScript("OnClick", function(self)
+  DB.settings.minimap.show = self:GetChecked() and true or false
+  UpdateMinimapButtonVisibility()
+  DB.__dirty = time()
+end)
+
+local optsBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+optsBtn:SetSize(120, 20)
+optsBtn:SetPoint("RIGHT", mm, "LEFT", -10, 0)
+optsBtn:SetText("Import/Export")
+optsBtn:SetScript("OnClick", function()
+  CreateOptionsPanel()
+  OpenOptionsPanel()
+end)
 
   local classLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   classLabel:SetPoint("TOPLEFT", 12, -54)
@@ -1966,9 +2287,20 @@ local function ToggleMainFrame()
   end
 end
 
+
 SLASH_CDMPROFILEVAULT1 = "/cdmv"
 SLASH_CDMPROFILEVAULT2 = "/cdmprofilevault"
-SlashCmdList["CDMPROFILEVAULT"] = function()
+SlashCmdList["CDMPROFILEVAULT"] = function(msg)
+  msg = Trim(msg or ""):lower()
+  if msg == "options" or msg == "option" or msg == "opt" then
+    CreateOptionsPanel()
+    OpenOptionsPanel()
+    return
+  end
+  if msg == "backup" or msg == "export" then
+    ShowCopyFrame(ExportFullBackup(), "Export FULL Backup (Ctrl+C)")
+    return
+  end
   ToggleMainFrame()
 end
 
@@ -2099,6 +2431,7 @@ loader:SetScript("OnEvent", function(_, event, a1, a2, a3, a4)
 
     CreateUI()
     CreateMinimapButton(ToggleMainFrame)
+    CreateOptionsPanel()
 
     if AddonCompartmentFrame and AddonCompartmentFrame.RegisterAddon then
       pcall(AddonCompartmentFrame.RegisterAddon, AddonCompartmentFrame, {
